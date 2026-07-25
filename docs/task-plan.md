@@ -45,6 +45,17 @@
   AnyRouter `gpt-5.6-sol` channel recovers from its current
   `500 get_channel_failed`.
 
+## Phase 6 - preserve divergent branches
+
+- [x] Confirm the operator wants all three divergent pairs preserved.
+- [x] Implement the resumable split state machine and effective pair graph.
+- [x] Cover every persisted phase, concurrency rejection, title/archive
+  isolation, missing artifacts, and no-orphan/no-repeat-backup behavior.
+- [x] Split the three real pairs, run a second sync, and verify AC17-AC19 with
+  database, rollout-fingerprint, catalog, and storage evidence.
+- [x] Complete independent implementation, QA, observability, and cleanup
+  reviews before amending the publication commit.
+
 Canonical validation command:
 
 ```sh

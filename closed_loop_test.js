@@ -154,7 +154,21 @@ COMMIT;`
     CODEX_SYNC_ALLOW_BOOTSTRAP: "1",
   };
 
-  const runSync = () => run(process.execPath, [SYNC_SCRIPT], { env });
+  const runSync = (extraEnv = {}) => run(process.execPath, [SYNC_SCRIPT], {
+    env: { ...env, ...extraEnv },
+  });
+  const runSyncExpectFailure = (extraEnv, expected) => {
+    try {
+      runSync(extraEnv);
+    } catch (error) {
+      const output = `${error.stdout || ""}\n${error.stderr || ""}`;
+      if (!output.includes(expected)) {
+        throw new Error(`Expected split failure containing ${expected}, got:\n${output}`);
+      }
+      return output;
+    }
+    throw new Error(`Expected split failure containing ${expected}`);
+  };
 
   const beforeOld = readLines(oldCopy).length;
   const beforeChild = readLines(childCopy).length;
@@ -249,8 +263,374 @@ COMMIT;`
     throw new Error(`Isolated conflict was not idempotent:\n${mergedIdempotent}`);
   }
 
+  const oldBeforeRetiredMetaFixture = readLines(oldCopy);
+  const oldMetaFixture = JSON.parse(oldBeforeRetiredMetaFixture[0]);
+  oldMetaFixture.payload = oldMetaFixture.payload || {};
+  oldMetaFixture.payload.model = "gpt-5.5";
+  oldBeforeRetiredMetaFixture[0] = JSON.stringify(oldMetaFixture);
+  fs.writeFileSync(oldCopy, oldBeforeRetiredMetaFixture.join("\n") + "\n");
+  const childBeforeManagedHistoryFixture = readLines(childCopy);
+  const childManagedHistoryMeta = JSON.parse(childBeforeManagedHistoryFixture[0]);
+  childManagedHistoryMeta.payload = childManagedHistoryMeta.payload || {};
+  childManagedHistoryMeta.payload.managed_by = "codex-session-sync/v3";
+  childManagedHistoryMeta.payload.portable_history_version = 3;
+  childBeforeManagedHistoryFixture[0] = JSON.stringify(childManagedHistoryMeta);
+  fs.writeFileSync(childCopy, childBeforeManagedHistoryFixture.join("\n") + "\n");
+  const oldOriginalBeforeSplit = fs.readFileSync(oldCopy);
+  let oldExpectedAfterConcurrentAppend = oldOriginalBeforeSplit;
+  const childOriginalBeforeSplit = fs.readFileSync(childCopy);
+  runSyncExpectFailure({
+    CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all",
+    CODEX_SYNC_TEST_FAIL_AFTER_SPLIT_PHASE: "planned",
+  }, "Injected conflict split failure after planned");
+  const plannedState = JSON.parse(fs.readFileSync(
+    path.join(env.CODEX_SYNC_WORK_DIR, "sync_state.json"),
+    "utf8"
+  ));
+  const plannedMigration = Object.values(plannedState.conflictSplitMigrations || {})[0];
+  if (!plannedMigration || plannedMigration.phase !== "planned") {
+    throw new Error(`Conflict split did not persist its plan: ${JSON.stringify(plannedMigration)}`);
+  }
+  const sourceCreatedMs = Number(sqlJson(
+    stateDb,
+    `SELECT COALESCE(created_at_ms,created_at*1000) AS created_at_ms
+     FROM threads WHERE id=${q(pair.old_id)} LIMIT 1;`
+  )[0].created_at_ms);
+  const sourceDate = new Date(sourceCreatedMs);
+  const pad = (value) => String(value).padStart(2, "0");
+  const collisionDir = path.join(
+    env.CODEX_SYNC_SESSIONS_ROOT,
+    String(sourceDate.getFullYear()),
+    pad(sourceDate.getMonth() + 1),
+    pad(sourceDate.getDate())
+  );
+  const collisionTimestamp = `${sourceDate.getFullYear()}-${pad(sourceDate.getMonth() + 1)}-${pad(sourceDate.getDate())}T${pad(sourceDate.getHours())}-${pad(sourceDate.getMinutes())}-${pad(sourceDate.getSeconds())}`;
+  const collisionPath = path.join(
+    collisionDir,
+    `rollout-${collisionTimestamp}-${plannedMigration.newOpenaiId}.jsonl`
+  );
+  fs.mkdirSync(collisionDir, { recursive: true });
+  const catalogColumns = sqlJson(catalogDb, "PRAGMA table_info(local_thread_catalog);")
+    .map((column) => column.name);
+  sqlExec(
+    catalogDb,
+    `INSERT INTO local_thread_catalog (${catalogColumns.map((name) => `"${name}"`).join(",")})
+     SELECT ${catalogColumns.map((name) =>
+       name === "thread_id" ? q(plannedMigration.newOpenaiId) : `"${name}"`
+     ).join(",")}
+     FROM local_thread_catalog
+     WHERE host_id='local' AND thread_id=${q(pair.child_id)}
+     LIMIT 1;`
+  );
+  runSyncExpectFailure(
+    { CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all" },
+    "Refusing counterpart creation because catalog thread ID already exists"
+  );
+  if (fs.existsSync(collisionPath)) {
+    throw new Error("Catalog ID collision created a rollout before refusing the migration");
+  }
+  sqlExec(
+    catalogDb,
+    `DELETE FROM local_thread_catalog
+     WHERE host_id='local' AND thread_id=${q(plannedMigration.newOpenaiId)};`
+  );
+  const collisionBytes = Buffer.from(JSON.stringify({
+    type: "session_meta",
+    payload: { id: "unrelated-collision", session_id: "unrelated-collision" },
+  }) + "\n");
+  fs.writeFileSync(collisionPath, collisionBytes);
+  runSyncExpectFailure(
+    { CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all" },
+    "Refusing to remove or adopt an unreferenced conflict-split rollout because its bytes changed"
+  );
+  if (!fs.readFileSync(collisionPath).equals(collisionBytes)) {
+    throw new Error("Conflict split overwrote an unrelated path collision");
+  }
+  fs.rmSync(collisionPath);
+  const markerCorrectCollisionBytes = Buffer.from([
+    JSON.stringify({
+      type: "session_meta",
+      payload: {
+        id: plannedMigration.newOpenaiId,
+        session_id: plannedMigration.newOpenaiId,
+        forked_from_id: pair.old_id,
+        conflict_split_migration_id: plannedMigration.id,
+        conflict_split_original_pair: plannedMigration.originalPairKey,
+        conflict_split_branch: "api",
+      },
+    }),
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "must never be deleted" }],
+      },
+    }),
+  ].join("\n") + "\n");
+  fs.writeFileSync(collisionPath, markerCorrectCollisionBytes);
+  runSyncExpectFailure(
+    { CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all" },
+    "Refusing to remove or adopt an unreferenced conflict-split rollout because its bytes changed"
+  );
+  if (!fs.readFileSync(collisionPath).equals(markerCorrectCollisionBytes)) {
+    throw new Error("Conflict split deleted or rewrote a marker-correct orphan containing new user data");
+  }
+  fs.rmSync(collisionPath);
+  for (const phase of [
+    "api_counterpart_committed",
+    "counterparts_committed",
+    "titles_committed",
+    "graph_committed",
+  ]) {
+    runSyncExpectFailure({
+      CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all",
+      CODEX_SYNC_TEST_FAIL_AFTER_SPLIT_PHASE: phase,
+    }, `Injected conflict split failure after ${phase}`);
+    if (phase === "api_counterpart_committed") {
+      const interruptedStatePath = path.join(env.CODEX_SYNC_WORK_DIR, "sync_state.json");
+      const interruptedState = JSON.parse(fs.readFileSync(interruptedStatePath, "utf8"));
+      const interruptedMigration = Object.values(interruptedState.conflictSplitMigrations || {})[0];
+      const preparedRow = sqlJson(
+        stateDb,
+        `SELECT rollout_path FROM threads WHERE id=${q(interruptedMigration.newOpenaiId)} LIMIT 1;`
+      )[0];
+      if (!preparedRow || !fs.existsSync(preparedRow.rollout_path)) {
+        throw new Error("Interrupted split did not leave a prepared counterpart fixture");
+      }
+      sqlExec(stateDb, `DELETE FROM threads WHERE id=${q(interruptedMigration.newOpenaiId)};`);
+      sqlExec(
+        catalogDb,
+        `DELETE FROM local_thread_catalog
+         WHERE host_id='local' AND thread_id=${q(interruptedMigration.newOpenaiId)};`
+      );
+      interruptedMigration.phase = "planned";
+      delete interruptedMigration.apiCounterpartCommittedAt;
+      fs.writeFileSync(interruptedStatePath, JSON.stringify(interruptedState, null, 2) + "\n");
+      appendVisibleTurn(oldCopy, "source-after-prepared-orphan", `source-grew-${Date.now()}`);
+      oldExpectedAfterConcurrentAppend = fs.readFileSync(oldCopy);
+      const prefixRecovery = runSyncExpectFailure({
+        CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all",
+        CODEX_SYNC_TEST_FAIL_AFTER_SPLIT_PHASE: "api_counterpart_committed",
+      }, "Injected conflict split failure after api_counterpart_committed");
+      if (!prefixRecovery.includes("Adopting a byte-exact prepared prefix")) {
+        throw new Error(`Prepared-prefix recovery did not adopt the safe interrupted file:\n${prefixRecovery}`);
+      }
+    }
+    if (phase === "counterparts_committed") {
+      const renamedDuringSplit = "renamed during split";
+      const catalogTitleBeforeRename = sqlJson(
+        catalogDb,
+        `SELECT display_title FROM local_thread_catalog
+         WHERE host_id='local' AND thread_id=${q(pair.child_id)} LIMIT 1;`
+      )[0].display_title;
+      sqlExec(
+        stateDb,
+        `UPDATE threads SET title=${q(renamedDuringSplit)} WHERE id=${q(pair.child_id)};`
+      );
+      runSyncExpectFailure(
+        { CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all" },
+        "Conflicting OpenAI title stores"
+      );
+      const catalogTitleAfterRefusal = sqlJson(
+        catalogDb,
+        `SELECT display_title FROM local_thread_catalog
+         WHERE host_id='local' AND thread_id=${q(pair.child_id)} LIMIT 1;`
+      )[0].display_title;
+      if (catalogTitleAfterRefusal !== catalogTitleBeforeRename) {
+        throw new Error("Conflict split overwrote the catalog while refusing a state-only rename");
+      }
+      sqlExec(
+        catalogDb,
+        `UPDATE local_thread_catalog
+         SET display_title=${q(renamedDuringSplit)},observation_sequence=observation_sequence+1
+         WHERE host_id='local' AND thread_id=${q(pair.child_id)};`
+      );
+      const renameAfterSnapshot = "renamed after title snapshot";
+      runSyncExpectFailure(
+        {
+          CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all",
+          CODEX_SYNC_TEST_RENAME_AFTER_SPLIT_TITLE_SNAPSHOT: renameAfterSnapshot,
+        },
+        "changed after its CAS snapshot"
+      );
+      const renamedStores = {
+        state: sqlJson(stateDb, `SELECT title FROM threads WHERE id=${q(pair.child_id)} LIMIT 1;`)[0].title,
+        catalog: sqlJson(
+          catalogDb,
+          `SELECT display_title FROM local_thread_catalog
+           WHERE host_id='local' AND thread_id=${q(pair.child_id)} LIMIT 1;`
+        )[0].display_title,
+      };
+      if (renamedStores.state !== renameAfterSnapshot ||
+          renamedStores.catalog !== renameAfterSnapshot) {
+        throw new Error(`Title CAS refusal overwrote a newer rename: ${JSON.stringify(renamedStores)}`);
+      }
+    }
+  }
+  const split = runSync({ CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS: "all" });
+  if (!split.includes("split conflicts completed: 1") ||
+      !split.includes("skipped conflicting pairs: 0")) {
+    throw new Error(`Conflict split did not complete cleanly:\n${split}`);
+  }
+  if (!fs.readFileSync(oldCopy).equals(oldExpectedAfterConcurrentAppend) ||
+      !fs.readFileSync(childCopy).equals(childOriginalBeforeSplit)) {
+    throw new Error("Conflict split rewrote one of the two original rollouts");
+  }
+
+  const splitStatePath = path.join(env.CODEX_SYNC_WORK_DIR, "sync_state.json");
+  const splitState = JSON.parse(fs.readFileSync(splitStatePath, "utf8"));
+  const migrations = Object.values(splitState.conflictSplitMigrations || {});
+  if (migrations.length !== 1 || migrations[0].phase !== "verified") {
+    throw new Error(`Conflict split migration state is not verified: ${JSON.stringify(migrations)}`);
+  }
+  const migration = migrations[0];
+  const replacementKeys = splitState.suppressedRawEdges &&
+    splitState.suppressedRawEdges[`${pair.old_id}<->${pair.child_id}`] &&
+    splitState.suppressedRawEdges[`${pair.old_id}<->${pair.child_id}`].replacementPairKeys;
+  if (!Array.isArray(replacementKeys) || replacementKeys.length !== 2 ||
+      splitState.pairs[`${pair.old_id}<->${pair.child_id}`] ||
+      replacementKeys.some((key) => !splitState.pairs[key])) {
+    throw new Error(`Conflict split effective graph is invalid: ${JSON.stringify(replacementKeys)}`);
+  }
+  const splitRows = sqlJson(
+    stateDb,
+    `SELECT id,rollout_path,model_provider,title,archived FROM threads
+     WHERE id IN (${[
+       pair.old_id,
+       pair.child_id,
+       migration.newOpenaiId,
+       migration.newApiId,
+     ].map(q).join(",")}) ORDER BY id;`
+  );
+  if (splitRows.length !== 4) throw new Error(`Conflict split did not preserve four rows: ${JSON.stringify(splitRows)}`);
+  const splitById = new Map(splitRows.map((row) => [row.id, row]));
+  const newOpenai = splitById.get(migration.newOpenaiId);
+  const newApi = splitById.get(migration.newApiId);
+  if (!newOpenai || newOpenai.model_provider !== "openai" ||
+      !newApi || !["custom", "proxy"].includes(newApi.model_provider)) {
+    throw new Error(`Conflict split created wrong providers: ${JSON.stringify(splitRows)}`);
+  }
+  if (!containsMarker(newOpenai.rollout_path, divergentOldMarker) ||
+      containsMarker(newOpenai.rollout_path, divergentChildMarker) ||
+      !containsMarker(newApi.rollout_path, divergentChildMarker) ||
+      containsMarker(newApi.rollout_path, divergentOldMarker)) {
+    throw new Error("Conflict split counterpart copied the wrong branch");
+  }
+  for (const row of splitRows) {
+    const expected = [pair.old_id, migration.newOpenaiId].includes(row.id)
+      ? migration.apiBranchTitle
+      : migration.openaiBranchTitle;
+    if (row.title !== expected) {
+      throw new Error(`Conflict split title mismatch for ${row.id}: ${row.title}`);
+    }
+  }
+
+  const verifiedStateBytes = fs.readFileSync(splitStatePath);
+  const damagedState = JSON.parse(verifiedStateBytes.toString("utf8"));
+  damagedState.suppressedRawEdges[migration.originalPairKey].migrationId = "damaged-migration-id";
+  fs.writeFileSync(splitStatePath, JSON.stringify(damagedState, null, 2) + "\n");
+  runSyncExpectFailure({}, "Committed conflict-split suppression is inconsistent");
+  fs.writeFileSync(splitStatePath, verifiedStateBytes);
+  const legacyState = JSON.parse(verifiedStateBytes.toString("utf8"));
+  legacyState.version = 2;
+  legacyState.suppressedRawEdges = {};
+  legacyState.conflictSplitMigrations = {};
+  fs.writeFileSync(splitStatePath, JSON.stringify(legacyState, null, 2) + "\n");
+  runSyncExpectFailure({}, "Refusing legacy pair-graph compaction");
+  const archiveStateAfterLegacyRefusal = sqlJson(
+    stateDb,
+    `SELECT id,archived FROM threads WHERE id IN (${[
+      pair.old_id,
+      pair.child_id,
+      migration.newOpenaiId,
+      migration.newApiId,
+    ].map(q).join(",")}) ORDER BY id;`
+  );
+  if (archiveStateAfterLegacyRefusal.some((row) => Number(row.archived) !== 0)) {
+    throw new Error(`Legacy-state refusal archived a split branch: ${JSON.stringify(archiveStateAfterLegacyRefusal)}`);
+  }
+  fs.writeFileSync(splitStatePath, verifiedStateBytes);
+
+  const backupBeforeSplitIdempotent = fs.readdirSync(backupRoot).sort().at(-1);
+  const splitIdempotent = runSync();
+  const backupAfterSplitIdempotent = fs.readdirSync(backupRoot).sort().at(-1);
+  if (!splitIdempotent.includes("changed pairs: 0") ||
+      backupBeforeSplitIdempotent !== backupAfterSplitIdempotent ||
+      fs.readdirSync(backupRoot).filter((name) => /^20/.test(name)).length !== 1) {
+    throw new Error(`Conflict split no-op run was not storage-idempotent:\n${splitIdempotent}`);
+  }
+
+  const detachedCounterpartBytes = fs.readFileSync(newOpenai.rollout_path);
+  sqlExec(stateDb, `DELETE FROM threads WHERE id=${q(migration.newOpenaiId)};`);
+  sqlExec(
+    catalogDb,
+    `DELETE FROM local_thread_catalog WHERE host_id='local' AND thread_id=${q(migration.newOpenaiId)};`
+  );
+  runSyncExpectFailure({}, "Refusing counterpart creation because rollout path already exists");
+  if (!fs.readFileSync(newOpenai.rollout_path).equals(detachedCounterpartBytes)) {
+    throw new Error("Missing-row recovery overwrote a detached counterpart rollout");
+  }
+  fs.rmSync(newOpenai.rollout_path);
+  const recoveredSplit = runSync();
+  if (!recoveredSplit.includes(`Recovered missing managed openai counterpart`) ||
+      !sqlJson(stateDb, `SELECT id FROM threads WHERE id=${q(migration.newOpenaiId)};`).length) {
+    throw new Error(`Missing split counterpart was not recovered:\n${recoveredSplit}`);
+  }
+  const recoveredOpenai = sqlJson(
+    stateDb,
+    `SELECT rollout_path FROM threads WHERE id=${q(migration.newOpenaiId)} LIMIT 1;`
+  )[0];
+  if (!recoveredOpenai || !fs.existsSync(recoveredOpenai.rollout_path) ||
+      !containsMarker(recoveredOpenai.rollout_path, divergentOldMarker) ||
+      containsMarker(recoveredOpenai.rollout_path, divergentChildMarker)) {
+    throw new Error("Recovered split counterpart did not preserve its branch");
+  }
+  const backupAfterRecovery = fs.readdirSync(backupRoot).sort().at(-1);
+  runSync();
+  if (fs.readdirSync(backupRoot).sort().at(-1) !== backupAfterRecovery ||
+      fs.readdirSync(backupRoot).filter((name) => /^20/.test(name)).length !== 1) {
+    throw new Error("Recovered split counterpart no-op run accumulated a backup");
+  }
+
+  sqlExec(stateDb, `DELETE FROM threads WHERE id=${q(openRetiredId)};`);
+  fs.rmSync(openRetiredPath, { force: true });
+  const archivedAt = Math.floor(Date.now() / 1000);
+  sqlExec(
+    stateDb,
+    `UPDATE threads SET archived=1,archived_at=${archivedAt} WHERE id=${q(pair.old_id)};`
+  );
+  const archiveSplit = runSync();
+  if (!archiveSplit.includes("archived linked counterparts: 1") &&
+      !archiveSplit.includes("enforced archived tombstones: 1")) {
+    throw new Error(`Conflict split archive did not propagate within its branch:\n${archiveSplit}`);
+  }
+  const archivedRows = new Map(sqlJson(
+    stateDb,
+    `SELECT id,archived FROM threads WHERE id IN (${[
+      pair.old_id,
+      pair.child_id,
+      migration.newOpenaiId,
+      migration.newApiId,
+    ].map(q).join(",")});`
+  ).map((row) => [row.id, Number(row.archived)]));
+  if (archivedRows.get(pair.old_id) !== 1 ||
+      archivedRows.get(migration.newOpenaiId) !== 1 ||
+      archivedRows.get(pair.child_id) !== 0 ||
+      archivedRows.get(migration.newApiId) !== 0) {
+    throw new Error(`Conflict split archive crossed branches: ${JSON.stringify([...archivedRows])}`);
+  }
+  const backupAfterArchive = fs.readdirSync(backupRoot).sort().at(-1);
+  runSync();
+  if (fs.readdirSync(backupRoot).sort().at(-1) !== backupAfterArchive ||
+      fs.readdirSync(backupRoot).filter((name) => /^20/.test(name)).length !== 1) {
+    throw new Error("Conflict split archive no-op run accumulated a backup");
+  }
+
   const integrity = run("sqlite3", [stateDb, "PRAGMA integrity_check;"]).trim();
-  if (integrity !== "ok") throw new Error(`Temp DB integrity failed: ${integrity}`);
+  const catalogIntegrity = run("sqlite3", [catalogDb, "PRAGMA integrity_check;"]).trim();
+  if (integrity !== "ok") throw new Error(`Temp state DB integrity failed: ${integrity}`);
+  if (catalogIntegrity !== "ok") throw new Error(`Temp catalog DB integrity failed: ${catalogIntegrity}`);
 
   console.log(JSON.stringify({
     ok: true,
@@ -259,11 +639,17 @@ COMMIT;`
     oldToOpenai: markerOld,
     openaiToOld: markerChild,
     divergentIsolation: { divergentOldMarker, divergentChildMarker },
+    conflictSplit: {
+      migrationId: migration.id,
+      newOpenaiId: migration.newOpenaiId,
+      newApiId: migration.newApiId,
+      replacementKeys,
+    },
     final: {
       oldLines: oldCountBeforeMergedIdempotent,
       openaiLines: childCountBeforeMergedIdempotent,
     },
-    integrity,
+    integrity: { state: integrity, catalog: catalogIntegrity },
   }, null, 2));
 }
 

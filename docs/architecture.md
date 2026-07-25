@@ -34,6 +34,19 @@ Data flow:
    validate postconditions, atomically save state, prune old backups, and let
    the launcher run SQLite integrity checks.
 
+Explicit conflict splitting runs before the normal pair graph is materialized.
+The state file records deterministic counterpart IDs and advances through
+`planned`, `api_counterpart_committed`, `counterparts_committed`,
+`titles_committed`, `graph_committed`, and `verified`. Counterpart creation is
+idempotent across its rollout, state-row, and catalog-row substeps; an
+unreferenced prepared file is removed only when its embedded migration identity
+matches exactly. The operation copies only healthy visible turns into two new
+managed counterparts and never rewrites the two original rollouts. The
+effective graph contains the two new cross-provider pairs and durably
+suppresses the obsolete raw `forked_from_id` edge. Startup resumes any
+non-verified migration before normal title, archive, recovery, or
+synchronization logic can observe the graph.
+
 Runtime artifacts live under the platform state directory (on macOS,
 `~/Library/Application Support/codex-session-sync`) and are excluded from Git.
 `CODEX_SYNC_*` environment variables override database, session, work,

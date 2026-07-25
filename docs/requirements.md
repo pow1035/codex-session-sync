@@ -44,6 +44,15 @@ corrupting local conversation data.
 - R13: Persist content-conflict evidence without partially merging it, recover a
   mechanically proven missing managed counterpart from healthy visible turns,
   and bound logs, backups, request size, and proxy concurrency.
+- R14: When explicitly requested, preserve both sides of a divergent managed
+  pair by splitting it into two independently synchronized cross-provider
+  branches. Never rewrite either original rollout, never infer a linear order
+  between the branches, durably suppress the obsolete raw fork edge, and make
+  an interrupted split resume forward without creating duplicate counterparts.
+- R15: A conflict split may create one new counterpart per original branch, but
+  it must retain only the normal single automatic recovery snapshot. Repeated
+  no-change runs must neither replace that snapshot nor accumulate orphan
+  rollout files.
 
 ## Assumptions
 

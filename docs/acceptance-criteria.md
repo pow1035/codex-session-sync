@@ -11,9 +11,9 @@
   event is reported as `missing_final_answer` and is not copied as healthy.
 - AC8: Paused goals, interrupted continuations, and subagent system errors are
   reported without modifying or fabricating conversation content.
-- AC9: Automatic backup runs never exceed configured retention; the default is
-  one recovery snapshot, and rollout files are backed up only on demand before
-  mutation.
+- AC9: Managed exits and the beginning of every later launch converge
+  automatic backups to configured retention; the default is one recovery
+  snapshot, and rollout files are backed up only on demand before mutation.
 - AC10: Re-running the sync without new input is idempotent.
 - AC11: The Git index contains no rollout, database, log, backup, local state,
   secret-like credential, or hard-coded user-home path.
@@ -32,3 +32,14 @@
 - AC16: Health exposes build identity and body-free counters; tests do not
   write production logs; sync/proxy logs rotate; request size and concurrency
   are bounded.
+- AC17: Explicitly splitting a divergent pair leaves both original rollout
+  files byte-identical, creates exactly two new counterpart IDs, and produces
+  two one-to-one effective pairs titled with distinct API/OpenAI branch labels.
+- AC18: Re-running every persisted split phase is idempotent. Simulated process
+  interruption, an existing target path, a concurrent source append, a missing
+  row, or a damaged suppression record must stop or resume without overwriting
+  an original, duplicating a counterpart, or cross-archiving the two branches.
+- AC19: After all selected real conflicts are split, the active effective graph
+  has no content conflict, titles and archives match within each branch, both
+  SQLite checks are `ok`, exactly one automatic recovery snapshot remains, and
+  a second no-change run retains the same snapshot directory.

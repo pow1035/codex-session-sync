@@ -128,3 +128,28 @@
   snapshot, and left exactly one 3.9 MiB backup with no SQLite sidecars.
   Postconditions remained: 48 active pairs, zero missing rollouts, zero
   archive/title mismatches, zero active `gpt-5.5`, and both databases `ok`.
+- Implemented an explicit preserve-both migration for the three remaining
+  divergent pairs. Each original provider history now has its own API/OpenAI
+  counterpart and an `【API分支】` or `【官网分支】` title; obsolete physical fork
+  edges are durably suppressed from the effective graph.
+- Closed two independent safety reviews before touching production. Full-byte
+  orphan adoption, catalog-ID collision refusal, guarded source insertion,
+  cross-database title CAS, legacy-state refusal, permanent original-rollout
+  protection, and startup backup pruning address all reported P1 risks.
+- A post-migration adversarial pass found additional future-resume gaps. Safe
+  prepared-prefix adoption now handles source growth, durable title snapshots
+  detect post-snapshot renames and converge partial cross-database commits,
+  semantic migration/suppression validation runs before any mutation, and
+  visible-history upgrades cannot target a protected original rollout.
+- Passed 26 proxy tests, 2 auth-helper tests, 4 installer tests, 18 lifecycle
+  assertions, 38 core assertions, and all five integration suites. Test
+  artifacts were removed and `closed-loop-runs` returned to 0 bytes.
+- The real split created six counterpart IDs and left all three migrations
+  `verified`, three raw edges suppressed, six replacement pairs present, and
+  zero content conflicts. All twelve state/catalog rows are active and title-
+  consistent; both SQLite integrity checks returned `ok`.
+- Five idle original rollouts remained exactly SHA-identical. The active repair
+  task grew only by normal Codex append, and its entire pre-migration byte range
+  remained identical. A second live sync created no split or counterpart; it
+  synchronized two unrelated active tasks and still converged backup retention
+  to one 29 MiB snapshot with zero temporary files.

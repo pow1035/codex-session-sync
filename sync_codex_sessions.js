@@ -243,6 +243,13 @@ function fileFingerprint(file) {
   };
 }
 
+function fingerprintsEqual(left, right) {
+  return Boolean(left && right &&
+    Number(left.size) === Number(right.size) &&
+    Number(left.mtimeMs) === Number(right.mtimeMs) &&
+    left.sha256 === right.sha256);
+}
+
 function validateRolloutEntries(entries, thread, label) {
   const invalidLines = entries
     .map((entry, index) => entry.obj ? null : index + 1)
@@ -1041,13 +1048,23 @@ function normalizePair(a, b) {
   return null;
 }
 
-function discoverPairs(threads, includeArchived = false) {
+function suppressedRawPairKeys(state) {
+  const suppressed = state && state.suppressedRawEdges;
+  if (!suppressed || typeof suppressed !== "object") return new Set();
+  return new Set(Object.entries(suppressed)
+    .filter(([, entry]) => entry && entry.status === "active")
+    .map(([key]) => key));
+}
+
+function discoverPairs(threads, includeArchived = false, state = null) {
   const pairs = [];
   const seen = new Set();
+  const suppressed = suppressedRawPairKeys(state);
   for (const raw of rawForkPairs(threads, includeArchived)) {
     const pair = normalizePair(raw.parent, raw.fork);
     if (!pair) continue;
     const key = pairKey(pair);
+    if (suppressed.has(key)) continue;
     if (seen.has(key)) continue;
     seen.add(key);
     pairs.push(pair);
@@ -1055,12 +1072,14 @@ function discoverPairs(threads, includeArchived = false) {
   return pairs;
 }
 
-function copyAndPatchRollout(source, newId, targetProvider, targetSettings, createdMs) {
+function preparePatchedRollout(source, newId, targetProvider, targetSettings, createdMs, options = {}) {
+  const beforeFingerprint = fileFingerprint(source.rollout_path);
+  if (options.expectedSourceFingerprint &&
+      !fingerprintsEqual(beforeFingerprint, options.expectedSourceFingerprint)) {
+    throw new Error(`Conflict split source changed before counterpart preparation: ${source.id}`);
+  }
   const sourceEntries = readJsonl(source.rollout_path);
   validateRolloutEntries(sourceEntries, source, "Cannot create counterpart from rollout");
-  const dir = path.join(SESSIONS_ROOT, String(new Date(createdMs).getFullYear()), String(new Date(createdMs).getMonth() + 1).padStart(2, "0"), String(new Date(createdMs).getDate()).padStart(2, "0"));
-  fs.mkdirSync(dir, { recursive: true });
-  const dest = path.join(dir, `rollout-${formatLocalFilenameDate(createdMs)}-${newId}.jsonl`);
 
   let meta = JSON.parse(JSON.stringify(sourceEntries[0].obj));
   if (targetSettings.rolloutPath && fs.existsSync(targetSettings.rolloutPath)) {
@@ -1086,6 +1105,11 @@ function copyAndPatchRollout(source, newId, targetProvider, targetSettings, crea
   delete meta.payload.context_window;
   meta.payload.portable_history_version = 4;
   meta.payload.managed_by = "codex-session-sync/v4";
+  if (options.metadata && typeof options.metadata === "object") {
+    for (const [key, value] of Object.entries(options.metadata)) {
+      if (value !== undefined) meta.payload[key] = value;
+    }
+  }
 
   const targetThread = {
     model: targetSettings.model,
@@ -1094,9 +1118,63 @@ function copyAndPatchRollout(source, newId, targetProvider, targetSettings, crea
   const output = [{ line: JSON.stringify(meta), obj: meta }].concat(
     parseClosedTurns(sourceEntries.slice(1), targetThread).flatMap((turn) => turn.entries)
   );
+  const afterFingerprint = fileFingerprint(source.rollout_path);
+  if (!fingerprintsEqual(beforeFingerprint, afterFingerprint)) {
+    throw new Error(`Conflict split source changed during counterpart preparation: ${source.id}`);
+  }
+  return output;
+}
+
+function rolloutBytes(entries) {
+  return Buffer.from(entries.map((entry) => entry.line).join("\n") + "\n");
+}
+
+function copyAndPatchRollout(source, newId, targetProvider, targetSettings, createdMs, options = {}) {
+  const output = preparePatchedRollout(
+    source,
+    newId,
+    targetProvider,
+    targetSettings,
+    createdMs,
+    options
+  );
+  const dir = path.join(SESSIONS_ROOT, String(new Date(createdMs).getFullYear()), String(new Date(createdMs).getMonth() + 1).padStart(2, "0"), String(new Date(createdMs).getDate()).padStart(2, "0"));
+  fs.mkdirSync(dir, { recursive: true });
+  const dest = path.join(dir, `rollout-${formatLocalFilenameDate(createdMs)}-${newId}.jsonl`);
+  if (fs.existsSync(dest)) {
+    throw new Error(`Refusing counterpart creation because rollout path already exists: ${dest}`);
+  }
   writeJsonl(dest, output);
   const mtime = new Date(source.updated_at_ms || source.updated_at * 1000 || createdMs);
   fs.utimesSync(dest, mtime, mtime);
+  return dest;
+}
+
+function adoptPreparedRollout(source, newId, targetProvider, targetSettings, createdMs, options = {}) {
+  const dest = counterpartRolloutPath(source, newId);
+  if (!fs.existsSync(dest)) {
+    throw new Error(`Prepared conflict-split rollout disappeared before recovery: ${dest}`);
+  }
+  const expected = rolloutBytes(preparePatchedRollout(
+    source,
+    newId,
+    targetProvider,
+    targetSettings,
+    createdMs,
+    options
+  ));
+  const actual = fs.readFileSync(dest);
+  const exact = actual.equals(expected);
+  const preservedPreparedPrefix = actual.length < expected.length &&
+    expected.subarray(0, actual.length).equals(actual);
+  if (!exact && !preservedPreparedPrefix) {
+    throw new Error(
+      `Refusing to remove or adopt an unreferenced conflict-split rollout because its bytes changed: ${dest}`
+    );
+  }
+  if (preservedPreparedPrefix) {
+    log(`Adopting a byte-exact prepared prefix after its source gained later complete turns: ${newId}.`);
+  }
   return dest;
 }
 
@@ -1129,7 +1207,7 @@ WHERE host_id='local';`,
   };
 }
 
-function createCounterpart(source, targetProvider, targetSettings, forcedId = null) {
+function createCounterpart(source, targetProvider, targetSettings, forcedId = null, options = {}) {
   if (!targetSettings || !targetSettings.model) {
     throw new Error(`No native ${targetProvider} model default is available; refusing cross-provider creation`);
   }
@@ -1137,10 +1215,20 @@ function createCounterpart(source, targetProvider, targetSettings, forcedId = nu
   if (sqlJson(STATE_DB, `SELECT 1 AS present FROM threads WHERE id=${q(newId)} LIMIT 1;`).length) {
     throw new Error(`Refusing counterpart creation because thread ID already exists: ${newId}`);
   }
+  if (fs.existsSync(CATALOG_DB) && sqlJson(
+    CATALOG_DB,
+    `SELECT 1 AS present FROM local_thread_catalog WHERE host_id='local' AND thread_id=${q(newId)} LIMIT 1;`
+  ).length) {
+    throw new Error(`Refusing counterpart creation because catalog thread ID already exists: ${newId}`);
+  }
   const createdMs = threadCreatedMs(source) || Date.now();
-  const rolloutPath = copyAndPatchRollout(source, newId, targetProvider, targetSettings, createdMs);
+  let createdRollout = false;
+  const rolloutPath = options.adoptPreparedRollout
+    ? adoptPreparedRollout(source, newId, targetProvider, targetSettings, createdMs, options)
+    : copyAndPatchRollout(source, newId, targetProvider, targetSettings, createdMs, options);
+  createdRollout = !options.adoptPreparedRollout;
   const nowSec = Math.floor(createdMs / 1000);
-  const displayTitle = catalogTitleFor(source);
+  const displayTitle = cleanTitle(options.title) || catalogTitleFor(source);
   const title = displayTitle || source.title || source.preview || "Synced Codex thread";
   const targetThreadSource = "user";
   const createdSec = Math.floor(createdMs / 1000);
@@ -1150,7 +1238,9 @@ function createCounterpart(source, targetProvider, targetSettings, forcedId = nu
   try {
     sqlExec(
       STATE_DB,
-      `INSERT INTO threads (
+      `BEGIN IMMEDIATE;
+      CREATE TEMP TABLE counterpart_insert_guard (changed INTEGER CHECK(changed=1));
+      INSERT INTO threads (
       id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
       sandbox_policy, approval_mode, tokens_used, has_user_event, archived, archived_at,
       git_sha, git_branch, git_origin_url, cli_version, first_user_message,
@@ -1163,14 +1253,19 @@ function createCounterpart(source, targetProvider, targetSettings, forcedId = nu
       git_sha, git_branch, git_origin_url, cli_version, first_user_message,
       agent_nickname, agent_role, memory_mode, ${q(targetModel)}, ${q(targetReasoningEffort)}, agent_path,
       ${createdMs}, updated_at_ms, ${q(targetThreadSource)}, preview, recency_at, recency_at_ms
-    FROM threads WHERE id=${q(source.id)};`
+    FROM threads WHERE id=${q(source.id)};
+    INSERT INTO counterpart_insert_guard VALUES (changes());
+    DROP TABLE counterpart_insert_guard;
+    COMMIT;`
     );
   } catch (error) {
-    try {
-      fs.unlinkSync(rolloutPath);
-    } catch (cleanupError) {
-      if (cleanupError.code !== "ENOENT") {
-        log(`FAILED to remove orphan rollout ${rolloutPath}: ${cleanupError}`);
+    if (createdRollout) {
+      try {
+        fs.unlinkSync(rolloutPath);
+      } catch (cleanupError) {
+        if (cleanupError.code !== "ENOENT") {
+          log(`FAILED to remove orphan rollout ${rolloutPath}: ${cleanupError}`);
+        }
       }
     }
     throw error;
@@ -1183,7 +1278,7 @@ function createCounterpart(source, targetProvider, targetSettings, forcedId = nu
         CATALOG_DB,
         `BEGIN IMMEDIATE;
       ${clock.prepare}
-      INSERT OR IGNORE INTO local_thread_catalog (
+      INSERT INTO local_thread_catalog (
         host_id, thread_id, display_title, source_created_at, source_updated_at, cwd,
         source_kind, source_detail, model_provider, git_branch, observation_sequence, missing_candidate
       )
@@ -1201,7 +1296,9 @@ function createCounterpart(source, targetProvider, targetSettings, forcedId = nu
       );
     } catch (error) {
       try { sqlExec(STATE_DB, `DELETE FROM threads WHERE id=${q(newId)};`); } catch {}
-      try { fs.unlinkSync(rolloutPath); } catch (cleanupError) { if (cleanupError.code !== "ENOENT") log(`FAILED to remove orphan rollout ${rolloutPath}: ${cleanupError}`); }
+      if (createdRollout) {
+        try { fs.unlinkSync(rolloutPath); } catch (cleanupError) { if (cleanupError.code !== "ENOENT") log(`FAILED to remove orphan rollout ${rolloutPath}: ${cleanupError}`); }
+      }
       throw error;
     }
   }
@@ -1222,6 +1319,705 @@ function createCounterpart(source, targetProvider, targetSettings, forcedId = nu
   };
 }
 
+const CONFLICT_SPLIT_PHASES = [
+  "planned",
+  "api_counterpart_committed",
+  "counterparts_committed",
+  "titles_committed",
+  "graph_committed",
+  "verified",
+];
+
+function conflictSplitPhaseAtLeast(migration, phase) {
+  const current = CONFLICT_SPLIT_PHASES.indexOf(migration.phase);
+  const expected = CONFLICT_SPLIT_PHASES.indexOf(phase);
+  if (current < 0 || expected < 0) {
+    throw new Error(`Invalid conflict split phase: ${migration.phase || "(missing)"}`);
+  }
+  return current >= expected;
+}
+
+function failAfterConflictSplitPhaseForTest(phase) {
+  if (process.env.CODEX_SYNC_TEST_FAIL_AFTER_SPLIT_PHASE === phase) {
+    throw new Error(`Injected conflict split failure after ${phase}`);
+  }
+}
+
+function splitBranchTitle(value, branch) {
+  const base = (cleanTitle(value) || "Untitled")
+    .replace(/【(?:API|官网)分支】$/u, "")
+    .trim();
+  return `${base}【${branch}分支】`;
+}
+
+function counterpartRolloutPath(source, newId) {
+  const createdMs = threadCreatedMs(source) || Date.now();
+  const date = new Date(createdMs);
+  const dir = path.join(
+    SESSIONS_ROOT,
+    String(date.getFullYear()),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0")
+  );
+  return path.join(dir, `rollout-${formatLocalFilenameDate(createdMs)}-${newId}.jsonl`);
+}
+
+function splitCounterpartMetadata(migration, branch) {
+  return {
+    conflict_split_migration_id: migration.id,
+    conflict_split_original_pair: migration.originalPairKey,
+    conflict_split_branch: branch,
+  };
+}
+
+function validateSplitCounterpart(thread, migration, branch, sourceId, targetProvider) {
+  if (!thread) throw new Error(`Conflict split counterpart is missing for ${migration.originalPairKey}: ${branch}`);
+  if (thread.model_provider !== targetProvider) {
+    throw new Error(`Conflict split counterpart ${thread.id} provider changed: expected ${targetProvider}, got ${thread.model_provider}`);
+  }
+  if (!thread.rollout_path || !fs.existsSync(thread.rollout_path)) {
+    throw new Error(`Conflict split counterpart rollout is missing: ${thread.id}`);
+  }
+  const meta = firstJson(thread.rollout_path);
+  if (!sessionMetaMatchesThread(meta, thread.id)) {
+    throw new Error(`Conflict split counterpart metadata does not belong to ${thread.id}`);
+  }
+  const payload = meta.payload || {};
+  if (payload.forked_from_id !== sourceId ||
+      payload.conflict_split_migration_id !== migration.id ||
+      payload.conflict_split_original_pair !== migration.originalPairKey ||
+      payload.conflict_split_branch !== branch) {
+    throw new Error(`Conflict split counterpart ${thread.id} has incompatible migration metadata`);
+  }
+  return thread;
+}
+
+function preparedSplitRolloutRecoveryMode(source, newId, migration, branch) {
+  const file = counterpartRolloutPath(source, newId);
+  if (!fs.existsSync(file)) return false;
+  const referenced = sqlJson(
+    STATE_DB,
+    `SELECT id FROM threads WHERE rollout_path=${q(file)} OR id=${q(newId)} LIMIT 1;`
+  );
+  if (referenced.length) {
+    throw new Error(`Refusing conflict-split path reuse because it is already referenced: ${file}`);
+  }
+  log(`Found an unreferenced prepared conflict-split rollout; it will be adopted only if every byte still matches the deterministic initial copy: ${newId}.`);
+  return true;
+}
+
+function ensureSplitCounterpart(source, newId, targetProvider, targetSettings, migration, branch, title) {
+  let thread = loadThreads().find((item) => item.id === newId);
+  if (!thread) {
+    const adoptPreparedRollout = preparedSplitRolloutRecoveryMode(
+      source,
+      newId,
+      migration,
+      branch
+    );
+    createCounterpart(source, targetProvider, targetSettings, newId, {
+      title,
+      expectedSourceFingerprint: migration.sourceFingerprints[source.id],
+      metadata: splitCounterpartMetadata(migration, branch),
+      adoptPreparedRollout,
+    });
+    thread = loadThreads().find((item) => item.id === newId);
+  }
+  validateSplitCounterpart(thread, migration, branch, source.id, targetProvider);
+  if (!thread.catalog_row_exists && fs.existsSync(CATALOG_DB)) {
+    ensureCatalogRows(loadThreads(), new Set([newId]));
+    thread = loadThreads().find((item) => item.id === newId);
+  }
+  if (fs.existsSync(CATALOG_DB) && !thread.catalog_row_exists) {
+    throw new Error(`Conflict split counterpart is missing its catalog row: ${newId}`);
+  }
+  return thread;
+}
+
+function conflictSplitSelection(state, rawValue = "") {
+  const raw = String(rawValue || "").trim();
+  if (!raw) return [];
+  const conflicts = Object.entries(state.pairs || {})
+    .filter(([, entry]) => entry && entry.contentConflict);
+  if (raw.toLowerCase() === "all") return conflicts.map(([key]) => key);
+  const selected = [];
+  for (const token of raw.split(",").map((value) => value.trim()).filter(Boolean)) {
+    const match = conflicts.find(([key, entry]) =>
+      token === key || token === entry.oldId || token === entry.childId);
+    if (!match) throw new Error(`Requested conflict split does not match an active content conflict: ${token}`);
+    if (!selected.includes(match[0])) selected.push(match[0]);
+  }
+  return selected;
+}
+
+function planConflictSplits(threads, state, rawValue = "") {
+  const selected = conflictSplitSelection(state, rawValue);
+  if (!selected.length) return 0;
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  let planned = 0;
+  state.version = Math.max(Number(state.version || 0), 6);
+  for (const originalPairKey of selected) {
+    if (state.suppressedRawEdges[originalPairKey] &&
+        state.suppressedRawEdges[originalPairKey].status === "active") continue;
+    if (state.conflictSplitMigrations[originalPairKey]) continue;
+    const entry = state.pairs[originalPairKey];
+    if (!entry || !entry.contentConflict || entry.status !== "active") {
+      throw new Error(`Conflict split requires an active persisted content conflict: ${originalPairKey}`);
+    }
+    const old = byId.get(entry.oldId);
+    const child = byId.get(entry.childId);
+    if (!old || !child || old.archived !== 0 || child.archived !== 0) {
+      throw new Error(`Conflict split requires both original threads to be active: ${originalPairKey}`);
+    }
+    if (!old.rollout_path || !child.rollout_path ||
+        !fs.existsSync(old.rollout_path) || !fs.existsSync(child.rollout_path)) {
+      throw new Error(`Conflict split original rollout is missing: ${originalPairKey}`);
+    }
+    if (!["custom", "proxy"].includes(old.model_provider) ||
+        child.model_provider !== "openai" || !old.model || !child.model) {
+      throw new Error(`Conflict split originals do not provide native target settings: ${originalPairKey}`);
+    }
+    const apiProvider = old.model_provider;
+    const baseTitle = cleanTitle(entry.titleSync && entry.titleSync.canonicalTitle) ||
+      cleanTitle(entry.title) || pairDisplayTitle({ old, child });
+    const migration = {
+      version: 1,
+      id: crypto.randomUUID(),
+      originalPairKey,
+      oldId: old.id,
+      childId: child.id,
+      newOpenaiId: uuidV4(),
+      newApiId: uuidV4(),
+      apiProvider,
+      apiBranchTitle: splitBranchTitle(baseTitle, "API"),
+      openaiBranchTitle: splitBranchTitle(baseTitle, "官网"),
+      sourceFingerprints: {
+        [old.id]: fileFingerprint(old.rollout_path),
+        [child.id]: fileFingerprint(child.rollout_path),
+      },
+      targetSettings: {
+        openai: {
+          model: child.model,
+          reasoning_effort: child.reasoning_effort || "high",
+          rolloutPath: child.rollout_path,
+        },
+        api: {
+          model: old.model,
+          reasoning_effort: old.reasoning_effort || "high",
+          rolloutPath: old.rollout_path,
+        },
+      },
+      originalConflict: JSON.parse(JSON.stringify(entry.contentConflict)),
+      plannedAt: new Date().toISOString(),
+      phase: "planned",
+    };
+    state.conflictSplitMigrations[originalPairKey] = migration;
+    planned += 1;
+  }
+  if (planned) saveSyncState(state);
+  return planned;
+}
+
+function refreshPlannedSplitFingerprint(migration, source) {
+  if (migration.phase !== "planned" &&
+      !(migration.phase === "api_counterpart_committed" && source.id === migration.childId)) {
+    return false;
+  }
+  const next = fileFingerprint(source.rollout_path);
+  if (fingerprintsEqual(next, migration.sourceFingerprints[source.id])) return false;
+  migration.sourceFingerprints[source.id] = next;
+  migration.sourceFingerprintRefreshedAt = new Date().toISOString();
+  return true;
+}
+
+function applyConflictSplitTitles(migration) {
+  const threads = loadThreads();
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  const targets = new Map([
+    [migration.oldId, migration.apiBranchTitle],
+    [migration.newOpenaiId, migration.apiBranchTitle],
+    [migration.childId, migration.openaiBranchTitle],
+    [migration.newApiId, migration.openaiBranchTitle],
+  ]);
+  const savedSnapshots = migration.titleCommitSnapshots || {};
+  const snapshots = [];
+  for (const [id, title] of targets) {
+    const thread = byId.get(id);
+    if (!thread) throw new Error(`Conflict split title target is missing: ${id}`);
+    const expected = savedSnapshots[id];
+    if (!expected) {
+      throw new Error(`Conflict split title CAS snapshot is missing for ${id}`);
+    }
+    if (fs.existsSync(CATALOG_DB)) {
+      if (!thread.catalog_row_exists) {
+        throw new Error(`Conflict split title target has no catalog row: ${id}`);
+      }
+    }
+    const stateDone = thread.title === title;
+    const stateExpected = thread.title === expected.title &&
+      Number(thread.archived || 0) === Number(expected.archived || 0);
+    const catalogDone = !fs.existsSync(CATALOG_DB) ||
+      (cleanTitle(thread.display_title) === title && Number(thread.missing_candidate || 0) === 0);
+    const catalogExpected = !fs.existsSync(CATALOG_DB) ||
+      (thread.display_title === expected.displayTitle &&
+       Number(thread.title_observation_sequence || 0) === Number(expected.catalogSeq || 0) &&
+       Number(thread.missing_candidate || 0) === Number(expected.missingCandidate || 0));
+    if ((!stateDone && !stateExpected) || (!catalogDone && !catalogExpected)) {
+      throw new Error(
+        `Conflict split title target ${id} changed after its CAS snapshot; refusing to overwrite the newer title`
+      );
+    }
+    snapshots.push({
+      thread,
+      title,
+      expected,
+      updateState: !stateDone,
+      updateCatalog: !catalogDone,
+    });
+  }
+  const attachCatalog = fs.existsSync(CATALOG_DB);
+  const guards = [];
+  if (attachCatalog) {
+    for (const { thread, title, expected, updateCatalog } of snapshots) {
+      if (!updateCatalog) continue;
+      guards.push(`
+UPDATE catalog.local_thread_catalog
+SET display_title=${q(title)},
+    observation_sequence=observation_sequence+1,
+    missing_candidate=0
+WHERE host_id='local' AND thread_id=${q(thread.id)}
+  AND ${sqlMatch("display_title", expected.displayTitle)}
+  AND observation_sequence=${Number(expected.catalogSeq || 0)}
+  AND missing_candidate=${Number(expected.missingCandidate || 0)};
+INSERT INTO split_title_guard VALUES (changes());`);
+    }
+  }
+  for (const { thread, title, expected, updateState } of snapshots) {
+    if (!updateState) continue;
+    guards.push(`
+UPDATE main.threads
+SET title=${q(title)}
+WHERE id=${q(thread.id)}
+  AND ${sqlMatch("title", expected.title)}
+  AND archived=${Number(expected.archived || 0)};
+INSERT INTO split_title_guard VALUES (changes());`);
+  }
+  if (!guards.length) {
+    return { stateRows: 0, catalogRows: 0, catalogSequences: new Map() };
+  }
+  sqlExec(
+    STATE_DB,
+    `${attachCatalog ? `ATTACH DATABASE ${q(CATALOG_DB)} AS catalog;` : ""}
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE split_title_guard (changed INTEGER CHECK(changed=1));
+${guards.join("\n")}
+${attachCatalog ? "UPDATE catalog.local_thread_catalog_metadata SET catalog_revision=catalog_revision+1 WHERE id=1;" : ""}
+DROP TABLE split_title_guard;
+COMMIT;
+${attachCatalog ? "DETACH DATABASE catalog;" : ""}`
+  );
+  return {
+    stateRows: snapshots.filter((item) => item.updateState).length,
+    catalogRows: attachCatalog ? snapshots.filter((item) => item.updateCatalog).length : 0,
+    catalogSequences: new Map(),
+  };
+}
+
+function conflictSplitSourceTitle(thread, label) {
+  const dbTitle = cleanTitle(thread.title);
+  const catalogTitle = cleanTitle(thread.display_title);
+  if (dbTitle && catalogTitle && dbTitle !== catalogTitle &&
+      dbTitle !== cleanTitle(thread.preview)) {
+    throw new Error(
+      `Conflicting ${label} title stores for ${thread.id}; refusing conflict split until DB and catalog titles agree`
+    );
+  }
+  return catalogTitle || dbTitle || cleanTitle(thread.preview) || "Untitled";
+}
+
+function refreshConflictSplitBranchTitles(migration) {
+  const threads = loadThreads();
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  const old = byId.get(migration.oldId);
+  const child = byId.get(migration.childId);
+  if (!old || !child) {
+    throw new Error(`Conflict split original title source is missing: ${migration.originalPairKey}`);
+  }
+  const apiTitle = splitBranchTitle(conflictSplitSourceTitle(old, "API/custom"), "API");
+  const openaiTitle = splitBranchTitle(conflictSplitSourceTitle(child, "OpenAI"), "官网");
+  const titleTargets = [
+    [migration.oldId, apiTitle],
+    [migration.newOpenaiId, apiTitle],
+    [migration.childId, openaiTitle],
+    [migration.newApiId, openaiTitle],
+  ];
+  const titleCommitSnapshots = {};
+  for (const [id] of titleTargets) {
+    const thread = byId.get(id);
+    if (!thread) throw new Error(`Conflict split title snapshot target is missing: ${id}`);
+    titleCommitSnapshots[id] = {
+      title: thread.title,
+      archived: Number(thread.archived || 0),
+      displayTitle: thread.display_title,
+      catalogSeq: Number(thread.title_observation_sequence || 0),
+      missingCandidate: Number(thread.missing_candidate || 0),
+    };
+  }
+  const changed = apiTitle !== migration.apiBranchTitle ||
+    openaiTitle !== migration.openaiBranchTitle ||
+    JSON.stringify(titleCommitSnapshots) !== JSON.stringify(migration.titleCommitSnapshots || {});
+  migration.apiBranchTitle = apiTitle;
+  migration.openaiBranchTitle = openaiTitle;
+  migration.titleCommitSnapshots = titleCommitSnapshots;
+  return changed;
+}
+
+function injectRenameAfterSplitTitleSnapshotForTest(migration) {
+  const title = cleanTitle(process.env.CODEX_SYNC_TEST_RENAME_AFTER_SPLIT_TITLE_SNAPSHOT);
+  if (!title) return;
+  sqlExec(
+    STATE_DB,
+    `UPDATE threads SET title=${q(title)} WHERE id=${q(migration.childId)};`
+  );
+  if (fs.existsSync(CATALOG_DB)) {
+    sqlExec(
+      CATALOG_DB,
+      `UPDATE local_thread_catalog
+       SET display_title=${q(title)},observation_sequence=observation_sequence+1
+       WHERE host_id='local' AND thread_id=${q(migration.childId)};`
+    );
+  }
+}
+
+function originalSplitTitleCommitStarted(migration) {
+  if (!migration.titleCommitSnapshots) return false;
+  const byId = new Map(loadThreads().map((thread) => [thread.id, thread]));
+  for (const [id, target] of [
+    [migration.oldId, migration.apiBranchTitle],
+    [migration.childId, migration.openaiBranchTitle],
+  ]) {
+    const thread = byId.get(id);
+    if (!thread) throw new Error(`Conflict split title recovery target is missing: ${id}`);
+    if (thread.title === target ||
+        (fs.existsSync(CATALOG_DB) && cleanTitle(thread.display_title) === target)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function splitPairState(pair, title, migration, branch) {
+  const oldEntries = readJsonl(pair.old.rollout_path);
+  const childEntries = readJsonl(pair.child.rollout_path);
+  const oldKeys = new Set(keysFor(oldEntries));
+  const childKeys = new Set(keysFor(childEntries));
+  return {
+    oldId: pair.old.id,
+    childId: pair.child.id,
+    title,
+    knownKeys: Array.from(oldKeys).filter((key) => childKeys.has(key)),
+    portableKeyVersion: 2,
+    initializedAt: new Date().toISOString(),
+    status: "active",
+    createdBySync: true,
+    conflictSplitMigrationId: migration.id,
+    conflictSplitBranch: branch,
+  };
+}
+
+function commitConflictSplitGraph(state, migration) {
+  const threads = loadThreads();
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  const apiBranch = normalizePair(byId.get(migration.oldId), byId.get(migration.newOpenaiId));
+  const openaiBranch = normalizePair(byId.get(migration.newApiId), byId.get(migration.childId));
+  if (!apiBranch || !openaiBranch) {
+    throw new Error(`Conflict split replacement providers are invalid: ${migration.originalPairKey}`);
+  }
+  const apiKey = pairKey(apiBranch);
+  const openaiKey = pairKey(openaiBranch);
+  delete state.pairs[migration.originalPairKey];
+  state.pairs[apiKey] = splitPairState(
+    apiBranch,
+    migration.apiBranchTitle,
+    migration,
+    "api"
+  );
+  state.pairs[openaiKey] = splitPairState(
+    openaiBranch,
+    migration.openaiBranchTitle,
+    migration,
+    "openai"
+  );
+  state.suppressedRawEdges[migration.originalPairKey] = {
+    version: 1,
+    status: "active",
+    reason: "preserve_both_conflict_branches",
+    migrationId: migration.id,
+    oldId: migration.oldId,
+    childId: migration.childId,
+    replacementPairKeys: [apiKey, openaiKey],
+    originalConflict: migration.originalConflict,
+    suppressedAt: new Date().toISOString(),
+  };
+  migration.replacementPairKeys = [apiKey, openaiKey];
+  migration.phase = "graph_committed";
+  migration.graphCommittedAt = new Date().toISOString();
+  saveSyncState(state);
+}
+
+function validateSuppressedRawEdges(threads, state) {
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  const rawKeys = new Set(rawForkPairs(threads, true)
+    .map((raw) => normalizePair(raw.parent, raw.fork))
+    .filter(Boolean)
+    .map(pairKey));
+  for (const [key, edge] of Object.entries(state.suppressedRawEdges || {})) {
+    if (!edge || edge.status !== "active") continue;
+    if (key !== `${edge.oldId}<->${edge.childId}` || !rawKeys.has(key)) {
+      throw new Error(`Suppressed conflict edge is missing or malformed: ${key}`);
+    }
+    if (state.pairs[key]) {
+      throw new Error(`Suppressed conflict edge was reintroduced into the effective graph: ${key}`);
+    }
+    if (!Array.isArray(edge.replacementPairKeys) || edge.replacementPairKeys.length !== 2 ||
+        new Set(edge.replacementPairKeys).size !== 2) {
+      throw new Error(`Suppressed conflict edge has an invalid replacement graph: ${key}`);
+    }
+    const owned = new Set();
+    for (const replacementKey of edge.replacementPairKeys) {
+      const pair = state.pairs[replacementKey];
+      if (!pair || replacementKey !== `${pair.oldId}<->${pair.childId}`) {
+        throw new Error(`Suppressed conflict edge replacement is missing: ${replacementKey}`);
+      }
+      for (const id of [pair.oldId, pair.childId]) {
+        if (!byId.has(id)) throw new Error(`Suppressed conflict replacement thread is missing: ${id}`);
+        if (owned.has(id)) throw new Error(`Suppressed conflict replacement graph reuses thread ${id}`);
+        owned.add(id);
+      }
+    }
+    if (owned.size !== 4 || !owned.has(edge.oldId) || !owned.has(edge.childId)) {
+      throw new Error(`Suppressed conflict replacement graph does not preserve both originals: ${key}`);
+    }
+  }
+  return true;
+}
+
+function validateConflictSplitStateBeforeMutation(threads, state) {
+  const migrations = state.conflictSplitMigrations || {};
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  const ownedIds = new Map();
+  const migrationIds = new Set();
+  for (const [key, migration] of Object.entries(migrations)) {
+    if (!migration || typeof migration !== "object") {
+      throw new Error(`Invalid conflict-split migration record: ${key}`);
+    }
+    if (!migration.id || migrationIds.has(migration.id)) {
+      throw new Error(`Invalid or duplicate conflict-split migration ID: ${key}`);
+    }
+    migrationIds.add(migration.id);
+    if (key !== migration.originalPairKey ||
+        key !== `${migration.oldId}<->${migration.childId}`) {
+      throw new Error(`Conflict-split migration key mismatch: ${key}`);
+    }
+    if (!CONFLICT_SPLIT_PHASES.includes(migration.phase)) {
+      throw new Error(`Invalid conflict-split migration phase for ${key}: ${migration.phase}`);
+    }
+    if (!["custom", "proxy"].includes(migration.apiProvider) ||
+        !migration.targetSettings || !migration.targetSettings.api ||
+        !migration.targetSettings.openai ||
+        !migration.targetSettings.api.model || !migration.targetSettings.openai.model) {
+      throw new Error(`Invalid conflict-split provider settings: ${key}`);
+    }
+    const ids = [
+      migration.oldId,
+      migration.childId,
+      migration.newOpenaiId,
+      migration.newApiId,
+    ];
+    if (ids.some((id) => !id) || new Set(ids).size !== 4) {
+      throw new Error(`Conflict-split migration does not own four distinct thread IDs: ${key}`);
+    }
+    for (const id of ids) {
+      if (ownedIds.has(id)) {
+        throw new Error(`Conflict-split thread ${id} is owned by both ${ownedIds.get(id)} and ${key}`);
+      }
+      ownedIds.set(id, key);
+    }
+    const old = byId.get(migration.oldId);
+    const child = byId.get(migration.childId);
+    if (!old || !child || old.model_provider !== migration.apiProvider ||
+        child.model_provider !== "openai") {
+      throw new Error(`Conflict-split originals are missing or have wrong providers: ${key}`);
+    }
+    for (const [id, branch, sourceId, provider] of [
+      [migration.newOpenaiId, "api", migration.oldId, "openai"],
+      [migration.newApiId, "openai", migration.childId, migration.apiProvider],
+    ]) {
+      const thread = byId.get(id);
+      if (thread) validateSplitCounterpart(thread, migration, branch, sourceId, provider);
+    }
+    const graphCommitted = conflictSplitPhaseAtLeast(migration, "graph_committed");
+    const suppression = state.suppressedRawEdges && state.suppressedRawEdges[key];
+    if (!graphCommitted) {
+      const original = state.pairs && state.pairs[key];
+      if (!original || original.oldId !== migration.oldId ||
+          original.childId !== migration.childId || suppression) {
+        throw new Error(`Pending conflict-split graph is inconsistent: ${key}`);
+      }
+      continue;
+    }
+    const expectedReplacementKeys = [
+      `${migration.oldId}<->${migration.newOpenaiId}`,
+      `${migration.newApiId}<->${migration.childId}`,
+    ];
+    if (!suppression || suppression.status !== "active" ||
+        suppression.migrationId !== migration.id ||
+        suppression.oldId !== migration.oldId ||
+        suppression.childId !== migration.childId ||
+        JSON.stringify(suppression.replacementPairKeys) !== JSON.stringify(expectedReplacementKeys) ||
+        JSON.stringify(migration.replacementPairKeys) !== JSON.stringify(expectedReplacementKeys) ||
+        state.pairs[key]) {
+      throw new Error(`Committed conflict-split suppression is inconsistent: ${key}`);
+    }
+    for (const [replacementKey, branch] of [
+      [expectedReplacementKeys[0], "api"],
+      [expectedReplacementKeys[1], "openai"],
+    ]) {
+      const pair = state.pairs[replacementKey];
+      if (!pair || pair.conflictSplitMigrationId !== migration.id ||
+          pair.conflictSplitBranch !== branch ||
+          replacementKey !== `${pair.oldId}<->${pair.childId}`) {
+        throw new Error(`Committed conflict-split replacement is inconsistent: ${replacementKey}`);
+      }
+    }
+  }
+  for (const [key, edge] of Object.entries(state.suppressedRawEdges || {})) {
+    if (!edge || edge.status !== "active") continue;
+    const migration = migrations[key];
+    if (!migration || edge.migrationId !== migration.id) {
+      throw new Error(`Suppressed conflict edge has no matching migration: ${key}`);
+    }
+  }
+  return true;
+}
+
+function verifyConflictSplit(state, migration) {
+  const threads = loadThreads();
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  validateSplitCounterpart(
+    byId.get(migration.newOpenaiId),
+    migration,
+    "api",
+    migration.oldId,
+    "openai"
+  );
+  validateSplitCounterpart(
+    byId.get(migration.newApiId),
+    migration,
+    "openai",
+    migration.childId,
+    migration.apiProvider
+  );
+  validateSuppressedRawEdges(threads, state);
+  for (const [id, expected] of [
+    [migration.oldId, migration.apiBranchTitle],
+    [migration.newOpenaiId, migration.apiBranchTitle],
+    [migration.childId, migration.openaiBranchTitle],
+    [migration.newApiId, migration.openaiBranchTitle],
+  ]) {
+    const thread = byId.get(id);
+    if (!thread || cleanTitle(thread.title) !== expected ||
+        (fs.existsSync(CATALOG_DB) && cleanTitle(thread.display_title) !== expected)) {
+      throw new Error(`Conflict split title verification failed for ${id}`);
+    }
+  }
+  migration.phase = "verified";
+  migration.verifiedAt = new Date().toISOString();
+  saveSyncState(state);
+}
+
+function runConflictSplitMigration(state, migration) {
+  let threads = loadThreads();
+  let byId = new Map(threads.map((thread) => [thread.id, thread]));
+  const old = byId.get(migration.oldId);
+  const child = byId.get(migration.childId);
+  if (!old || !child) throw new Error(`Conflict split original thread is missing: ${migration.originalPairKey}`);
+  if (migration.phase === "planned") failAfterConflictSplitPhaseForTest("planned");
+
+  if (!conflictSplitPhaseAtLeast(migration, "api_counterpart_committed")) {
+    if (refreshPlannedSplitFingerprint(migration, old)) saveSyncState(state);
+    ensureSplitCounterpart(
+      old,
+      migration.newOpenaiId,
+      "openai",
+      migration.targetSettings.openai,
+      migration,
+      "api",
+      migration.apiBranchTitle
+    );
+    migration.phase = "api_counterpart_committed";
+    migration.apiCounterpartCommittedAt = new Date().toISOString();
+    saveSyncState(state);
+    failAfterConflictSplitPhaseForTest(migration.phase);
+  }
+
+  if (!conflictSplitPhaseAtLeast(migration, "counterparts_committed")) {
+    threads = loadThreads();
+    byId = new Map(threads.map((thread) => [thread.id, thread]));
+    const currentChild = byId.get(migration.childId);
+    if (refreshPlannedSplitFingerprint(migration, currentChild)) saveSyncState(state);
+    ensureSplitCounterpart(
+      currentChild,
+      migration.newApiId,
+      migration.apiProvider,
+      migration.targetSettings.api,
+      migration,
+      "openai",
+      migration.openaiBranchTitle
+    );
+    migration.phase = "counterparts_committed";
+    migration.counterpartsCommittedAt = new Date().toISOString();
+    saveSyncState(state);
+    failAfterConflictSplitPhaseForTest(migration.phase);
+  }
+
+  if (!conflictSplitPhaseAtLeast(migration, "titles_committed")) {
+    if (!originalSplitTitleCommitStarted(migration) &&
+        refreshConflictSplitBranchTitles(migration)) {
+      saveSyncState(state);
+    }
+    injectRenameAfterSplitTitleSnapshotForTest(migration);
+    applyConflictSplitTitles(migration);
+    migration.phase = "titles_committed";
+    migration.titlesCommittedAt = new Date().toISOString();
+    saveSyncState(state);
+    failAfterConflictSplitPhaseForTest(migration.phase);
+  }
+
+  if (!conflictSplitPhaseAtLeast(migration, "graph_committed")) {
+    commitConflictSplitGraph(state, migration);
+    failAfterConflictSplitPhaseForTest(migration.phase);
+  }
+
+  if (!conflictSplitPhaseAtLeast(migration, "verified")) {
+    verifyConflictSplit(state, migration);
+  }
+}
+
+function processConflictSplits(threads, state, rawValue = "") {
+  const planned = planConflictSplits(threads, state, rawValue);
+  let completed = 0;
+  for (const migration of Object.values(state.conflictSplitMigrations || {})) {
+    if (!migration || migration.phase === "verified") continue;
+    runConflictSplitMigration(state, migration);
+    completed += 1;
+    log(`Preserved both divergent branches for "${titleForLog(
+      migration.apiBranchTitle.replace(/【API分支】$/u, "")
+    )}" (${migration.originalPairKey}); created ${migration.newOpenaiId} and ${migration.newApiId}.`);
+  }
+  return { planned, completed };
+}
+
 function recoverMissingManagedCounterparts(threads, state) {
   const byId = new Map(threads.map((thread) => [thread.id, thread]));
   const targetDefaults = providerDefaults(threads);
@@ -1237,15 +2033,43 @@ function recoverMissingManagedCounterparts(threads, state) {
         !fs.existsSync(source.rollout_path)) continue;
     const sourceMeta = firstJson(source.rollout_path);
     const payload = sourceMeta.payload || {};
-    const provenManaged = String(payload.managed_by || "").startsWith("codex-session-sync/") ||
+    let recoveryOptions = {};
+    let splitManaged = false;
+    let splitMigration = null;
+    if (entry.conflictSplitMigrationId) {
+      const migration = Object.values(state.conflictSplitMigrations || {})
+        .find((item) => item && item.id === entry.conflictSplitMigrationId);
+      const expectedMissingId = entry.conflictSplitBranch === "api"
+        ? migration && migration.newOpenaiId
+        : migration && migration.newApiId;
+      if (!migration || migration.phase !== "verified" || missingId !== expectedMissingId) {
+        continue;
+      }
+      splitManaged = true;
+      splitMigration = migration;
+      recoveryOptions = {
+        title: entry.title,
+        metadata: splitCounterpartMetadata(migration, entry.conflictSplitBranch),
+      };
+    }
+    const provenManaged = splitManaged ||
+      String(payload.managed_by || "").startsWith("codex-session-sync/") ||
       payload.forked_from_id === missingId;
     if (!provenManaged) continue;
-    const targetProvider = old ? "openai" : chooseApiProvider(targetDefaults);
+    const targetProvider = splitManaged
+      ? (old ? "openai" : splitMigration.apiProvider)
+      : (old ? "openai" : chooseApiProvider(targetDefaults));
+    const targetSettings = splitManaged
+      ? (targetProvider === "openai"
+        ? splitMigration.targetSettings.openai
+        : splitMigration.targetSettings.api)
+      : targetDefaults.get(targetProvider);
     const counterpart = createCounterpart(
       source,
       targetProvider,
-      targetDefaults.get(targetProvider),
-      missingId
+      targetSettings,
+      missingId,
+      recoveryOptions
     );
     const sourceKeys = new Set(keysFor(readJsonl(source.rollout_path)));
     const counterpartKeys = new Set(keysFor(readJsonl(counterpart.rollout_path)));
@@ -1432,7 +2256,7 @@ COMMIT;`
   ).trim().split(/\s+/).pop());
 }
 
-function migrateRetiredActiveModels(threads, defaultThreads = threads, state) {
+function migrateRetiredActiveModels(threads, defaultThreads = threads, state, protectedThreadIds = new Set()) {
   const defaults = providerDefaults(defaultThreads);
   const plans = [];
   const skippedWithoutNativeDefault = [];
@@ -1444,6 +2268,11 @@ function migrateRetiredActiveModels(threads, defaultThreads = threads, state) {
   state.version = Math.max(Number(state.version || 0), 5);
   for (const thread of threads) {
     if (thread.archived !== 0 || !thread.rollout_path || !fs.existsSync(thread.rollout_path)) continue;
+    if (protectedThreadIds.has(thread.id)) {
+      deferredOpen.push(thread);
+      log(`Protected original conflict-split rollout from model metadata rewrite: ${thread.id}.`);
+      continue;
+    }
     let rolloutEntries;
     try {
       rolloutEntries = readJsonl(thread.rollout_path);
@@ -1847,6 +2676,9 @@ function restoreExplicitPairActive(threads, state, rawValue = "") {
   if (!left || !right) throw new Error(`Cannot restore active pair; thread not found: ${ids.find((id) => !byId.has(id))}`);
   const pair = normalizePair(left, right);
   if (!pair) throw new Error(`Cannot restore active pair; IDs are not an openai/custom provider pair: ${ids.join(",")}`);
+  if (suppressedRawPairKeys(state).has(pairKey(pair))) {
+    throw new Error(`Cannot restore obsolete split edge ${pairKey(pair)}; restore one of its effective branch pairs instead`);
+  }
   const linked = rawForkPairs(threads, true).some((rawPair) => {
     const normalized = normalizePair(rawPair.parent, rawPair.fork);
     return normalized && pairKey(normalized) === pairKey(pair);
@@ -1983,6 +2815,13 @@ function normalizeSyncState(raw) {
   const state = raw && typeof raw === "object" ? raw : {};
   state.version = Number(state.version || 2);
   state.pairs = state.pairs && typeof state.pairs === "object" ? state.pairs : {};
+  state.suppressedRawEdges = state.suppressedRawEdges && typeof state.suppressedRawEdges === "object"
+    ? state.suppressedRawEdges
+    : {};
+  state.conflictSplitMigrations = state.conflictSplitMigrations &&
+    typeof state.conflictSplitMigrations === "object"
+    ? state.conflictSplitMigrations
+    : {};
   state.retiredThreadIds = Array.isArray(state.retiredThreadIds) ? state.retiredThreadIds : [];
   const rawWatermark = state.lastSuccessfulAtMs === undefined || state.lastSuccessfulAtMs === null
     ? 0
@@ -1999,10 +2838,12 @@ function normalizeSyncState(raw) {
 
 function upsertCurrentPairLifecycle(threads, state) {
   const now = new Date().toISOString();
+  const suppressed = suppressedRawPairKeys(state);
   for (const raw of rawForkPairs(threads, true)) {
     const pair = normalizePair(raw.parent, raw.fork);
     if (!pair) continue;
     const key = pairKey(pair);
+    if (suppressed.has(key)) continue;
     const isNew = !state.pairs[key];
     const entry = state.pairs[key] || {
       oldId: pair.old.id,
@@ -2033,9 +2874,26 @@ function upsertCurrentPairLifecycle(threads, state) {
 
 function compactAndValidatePairGraph(threads, state) {
   const currentKeys = new Set();
+  const suppressed = suppressedRawPairKeys(state);
   for (const raw of rawForkPairs(threads, true)) {
     const pair = normalizePair(raw.parent, raw.fork);
-    if (pair) currentKeys.add(pairKey(pair));
+    if (pair && !suppressed.has(pairKey(pair))) currentKeys.add(pairKey(pair));
+  }
+  if (state.version < 3) {
+    const physicalSplitThreads = threads.filter((thread) => {
+      if (!thread.rollout_path || !fs.existsSync(thread.rollout_path)) return false;
+      try {
+        const payload = firstJson(thread.rollout_path).payload || {};
+        return Boolean(payload.conflict_split_migration_id);
+      } catch {
+        return false;
+      }
+    });
+    if (physicalSplitThreads.length) {
+      throw new Error(
+        `Refusing legacy pair-graph compaction because ${physicalSplitThreads.length} conflict-split rollout(s) exist; restore a version 3+ last-good sync state`
+      );
+    }
   }
   if (state.version >= 3) {
     const owners = new Map();
@@ -2150,8 +3008,9 @@ function ensureCatalogRows(threads, eligibleIds) {
     sqlExec(
       CATALOG_DB,
       `BEGIN IMMEDIATE;
+      CREATE TEMP TABLE catalog_repair_guard (changed INTEGER CHECK(changed=1));
       ${clock.prepare}
-      INSERT OR IGNORE INTO local_thread_catalog (
+      INSERT INTO local_thread_catalog (
         host_id, thread_id, display_title, source_created_at, source_updated_at, cwd,
         source_kind, source_detail, model_provider, git_branch, observation_sequence, missing_candidate
       ) VALUES (
@@ -2159,7 +3018,9 @@ function ensureCatalogRows(threads, eligibleIds) {
         ${thread.updated_at || Math.floor(Date.now() / 1000)}, ${q(thread.cwd)}, 'vscode', NULL,
         ${q(thread.model_provider)}, NULL, ${clock.value}, 0
       );
+      INSERT INTO catalog_repair_guard VALUES (changes());
       UPDATE local_thread_catalog_metadata SET catalog_revision = catalog_revision + 1 WHERE id=1;
+      DROP TABLE catalog_repair_guard;
       COMMIT;`
     );
     existing.add(thread.id);
@@ -2687,11 +3548,15 @@ function isDeferredVisibleHistoryRewriteError(error) {
   );
 }
 
-function upgradePortableOnlyPairs(pairs) {
+function upgradePortableOnlyPairs(pairs, protectedTargetIds = new Set()) {
   let upgraded = 0;
   let skippedUnsafe = 0;
   for (const pair of pairs) {
     for (const [source, target] of [[pair.old, pair.child], [pair.child, pair.old]]) {
+      if (protectedTargetIds.has(target.id)) {
+        skippedUnsafe += 1;
+        continue;
+      }
       try {
         const result = upgradePortableOnlyTarget(source, target);
         upgraded += result.upgraded;
@@ -3142,9 +4007,14 @@ function main() {
   const runStartedMs = Date.now();
   fs.mkdirSync(WORK_DIR, { recursive: true });
   fs.mkdirSync(BACKUP_ROOT, { recursive: true });
+  // A previous run may have been killed before its finally block. Converge the
+  // automatic backup set before allocating another snapshot so repeated
+  // interrupted launches cannot accumulate indefinitely.
+  pruneAutomaticBackups();
 
   const state = loadSyncState();
   let threads = loadThreads();
+  validateConflictSplitStateBeforeMutation(threads, state);
 
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const backupDir = path.join(BACKUP_ROOT, stamp);
@@ -3156,6 +4026,13 @@ function main() {
   copyIfExists(STATE_FILE, backupDir, backupContext);
   saveBackupManifest(backupContext);
   markBackupComplete(backupContext);
+
+  const conflictSplit = processConflictSplits(
+    threads,
+    state,
+    process.env.CODEX_SYNC_SPLIT_CONFLICT_PAIR_KEYS
+  );
+  if (conflictSplit.planned || conflictSplit.completed) threads = loadThreads();
 
   const restoredActivePairs = restoreExplicitPairActive(
     threads,
@@ -3202,7 +4079,8 @@ function main() {
   // the archive tombstone to win for visibility.
   upsertCurrentPairLifecycle(threads, state);
   compactAndValidatePairGraph(threads, state);
-  const preLifecycleTitlePairs = discoverPairs(threads, true).filter((pair) => {
+  validateSuppressedRawEdges(threads, state);
+  const preLifecycleTitlePairs = discoverPairs(threads, true, state).filter((pair) => {
     const entry = state.pairs[pairKey(pair)];
     const trusted = cleanTitle(entry && entry.titleSync && entry.titleSync.canonicalTitle) ||
       (entry && !entry.titleBaselineUntrusted && cleanTitle(entry.title));
@@ -3227,7 +4105,17 @@ function main() {
   upsertCurrentPairLifecycle(threads, state);
   refreshPairLifecycleState(threads, state);
 
-  const modelMigration = migrateRetiredActiveModels(loadAllThreadsForModelMaintenance(), threads, state);
+  const protectedSplitOriginalIds = new Set(
+    Object.values(state.conflictSplitMigrations || {}).flatMap((migration) =>
+      migration ? [migration.oldId, migration.childId] : []
+    ).filter(Boolean)
+  );
+  const modelMigration = migrateRetiredActiveModels(
+    loadAllThreadsForModelMaintenance(),
+    threads,
+    state,
+    protectedSplitOriginalIds
+  );
   const deferredModelPostconditions = [
     ...modelMigration.deferredThreadIds,
     ...modelMigration.skippedEmptyThreadIds,
@@ -3238,11 +4126,11 @@ function main() {
   const createdCounterparts = ensureResult.created;
   if (createdCounterparts.length) threads = loadThreads();
 
-  const pairs = discoverPairs(threads);
+  const pairs = discoverPairs(threads, false, state);
   const catalogEligibleIds = new Set(pairs.flatMap((pair) => [pair.old.id, pair.child.id]));
   const repairedCatalogRows = ensureCatalogRows(threads, catalogEligibleIds);
   if (repairedCatalogRows) threads = loadThreads();
-  const activePairs = discoverPairs(threads);
+  const activePairs = discoverPairs(threads, false, state);
   const activeTitleSync = syncPairTitles(activePairs, state);
   const titleSyncResult = {
     changedPairs: preLifecycleTitleSync.changedPairs + activeTitleSync.changedPairs,
@@ -3262,6 +4150,8 @@ function main() {
     saveSyncState(state);
     discardRedundantBackup(backupContext, [
       restoredActivePairs,
+      conflictSplit.planned,
+      conflictSplit.completed,
       toolSearchRepair.records,
       recoveredMissingCounterparts,
       repairedInvisibleThreads,
@@ -3277,12 +4167,12 @@ function main() {
       createdCounterparts.length,
       repairedCatalogRows,
     ].reduce((sum, value) => sum + Number(value || 0), 0));
-    log(`No active custom/openai fork pairs found. Repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; recovered interrupted archives: ${recoveredInterruptedArchives}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; skipped retired models without a native default: ${modelMigration.skippedWithoutNativeDefault}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}.`);
+    log(`No active custom/openai fork pairs found. Split conflicts planned: ${conflictSplit.planned}; split conflicts completed: ${conflictSplit.completed}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; recovered interrupted archives: ${recoveredInterruptedArchives}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; skipped retired models without a native default: ${modelMigration.skippedWithoutNativeDefault}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}.`);
     return;
   }
 
-  const historyUpgrade = upgradePortableOnlyPairs(syncPairs);
-  log(`Found ${syncPairs.length} active mapped pairs. Newly created counterparts: ${createdCounterparts.length}; restored visible-history structure: ${historyUpgrade.upgraded}; skipped unsafe visible-history upgrades: ${historyUpgrade.skippedUnsafe}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; backup files reused: ${backupContext.linked}; backup files copied: ${backupContext.copied}; recovered interrupted archives: ${recoveredInterruptedArchives}; archived linked counterparts: ${archivedCounterparts}; enforced archived tombstones: ${enforcedArchivedTombstones}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; synchronized titles: ${titleSyncResult.displayChangedPairs}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}; repaired catalog rows: ${repairedCatalogRows}. Backup: ${backupDir}`);
+  const historyUpgrade = upgradePortableOnlyPairs(syncPairs, protectedSplitOriginalIds);
+  log(`Found ${syncPairs.length} active mapped pairs. Split conflicts planned: ${conflictSplit.planned}; split conflicts completed: ${conflictSplit.completed}; newly created counterparts: ${createdCounterparts.length}; restored visible-history structure: ${historyUpgrade.upgraded}; skipped unsafe visible-history upgrades: ${historyUpgrade.skippedUnsafe}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; backup files reused: ${backupContext.linked}; backup files copied: ${backupContext.copied}; recovered interrupted archives: ${recoveredInterruptedArchives}; archived linked counterparts: ${archivedCounterparts}; enforced archived tombstones: ${enforcedArchivedTombstones}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; synchronized titles: ${titleSyncResult.displayChangedPairs}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}; repaired catalog rows: ${repairedCatalogRows}. Backup: ${backupDir}`);
   const results = syncPairs.map((pair) => syncPair(pair, state));
   applyDbTimes(
     results.filter((result) =>
@@ -3303,6 +4193,7 @@ function main() {
   if (finalRetiredThreads) threads = loadThreads();
   upsertCurrentPairLifecycle(threads, state);
   refreshPairLifecycleState(threads, state);
+  validateSuppressedRawEdges(threads, state);
   const finalArchivedTombstones = enforceArchivedPairState(threads, state);
   if (finalArchivedTombstones) threads = loadThreads();
   const finalArchivedCounterparts = syncArchivedForkGroups(threads, state);
@@ -3323,6 +4214,8 @@ function main() {
   const childAdded = results.reduce((sum, result) => sum + result.childAdded, 0);
   const materialMutationCount = [
     restoredActivePairs,
+    conflictSplit.planned,
+    conflictSplit.completed,
     toolSearchRepair.records,
     recoveredMissingCounterparts,
     repairedInvisibleThreads,
@@ -3348,7 +4241,7 @@ function main() {
   ].reduce((sum, value) => sum + Number(value || 0), 0);
   discardRedundantBackup(backupContext, materialMutationCount);
 
-  log(`Sync complete. Newly created counterparts: ${createdCounterparts.length}; restored visible-history structure: ${historyUpgrade.upgraded}; skipped unsafe visible-history upgrades: ${historyUpgrade.skippedUnsafe}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; deferred incomplete turns: ${deferredIncomplete.length}; recovered interrupted archives: ${recoveredInterruptedArchives}; archived linked counterparts: ${archivedCounterparts}; enforced archived tombstones: ${enforcedArchivedTombstones}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; synchronized titles: ${titleSyncResult.displayChangedPairs}; title storage rows repaired: ${titleSyncResult.stateRows + titleSyncResult.catalogRows}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}; skipped conflicting pairs: ${skippedConflicts.length}; repaired catalog rows: ${repairedCatalogRows}; initialized pairs: ${initialized.length}; changed pairs: ${changed.length}; added to API/custom: ${oldAdded}; added to OpenAI: ${childAdded}; rollout backups copied: ${backupContext.copied}; rollout backups reused: ${backupContext.linked}.`);
+  log(`Sync complete. Split conflicts planned: ${conflictSplit.planned}; split conflicts completed: ${conflictSplit.completed}; newly created counterparts: ${createdCounterparts.length}; restored visible-history structure: ${historyUpgrade.upgraded}; skipped unsafe visible-history upgrades: ${historyUpgrade.skippedUnsafe}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; deferred incomplete turns: ${deferredIncomplete.length}; recovered interrupted archives: ${recoveredInterruptedArchives}; archived linked counterparts: ${archivedCounterparts}; enforced archived tombstones: ${enforcedArchivedTombstones}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; synchronized titles: ${titleSyncResult.displayChangedPairs}; title storage rows repaired: ${titleSyncResult.stateRows + titleSyncResult.catalogRows}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}; skipped conflicting pairs: ${skippedConflicts.length}; repaired catalog rows: ${repairedCatalogRows}; initialized pairs: ${initialized.length}; changed pairs: ${changed.length}; added to API/custom: ${oldAdded}; added to OpenAI: ${childAdded}; rollout backups copied: ${backupContext.copied}; rollout backups reused: ${backupContext.linked}.`);
   for (const result of skippedConflicts.slice(0, 20)) {
     log(`WARNING: Skipped conflicting pair "${titleForLog(result.title)}" (${result.oldId} <-> ${result.childId}); pending API/custom -> OpenAI: ${result.apiCustomPending}, pending OpenAI -> API/custom: ${result.openaiPending}.`);
   }
