@@ -1,0 +1,36 @@
+.DS_Store
+node_modules/
+
+# Machine-local runtime state. Never publish conversation data or databases.
+backups/
+repair-backups/
+closed-loop-runs/
+work/
+sync.log
+sync.lock
+sync_state.json
+sync_state.json.last-good
+health-report.json
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+
+# Temporary and editor files.
+*.tmp
+*.swp
+*.bak
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.log
+coverage/
+.nyc_output/
+npm-debug.log*
