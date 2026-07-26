@@ -28,7 +28,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError
 from urllib.parse import urljoin, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    HTTPRedirectHandler,
+    ProxyHandler as UpstreamProxyHandler,
+    Request,
+    build_opener,
+    getproxies,
+)
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -415,11 +421,19 @@ class ProxyServer(ThreadingHTTPServer):
         self._request_slots = threading.BoundedSemaphore(
             DEFAULT_MAX_CONCURRENT_REQUESTS
         )
-        # The default opener honors macOS SystemConfiguration proxies. This is
-        # required on machines where Codex reaches AnyRouter through a system
-        # proxy while direct TLS to the origin is intentionally unavailable.
-        self.upstream_opener = build_opener(SameOriginRedirectHandler())
         super().__init__(address, ProxyHandler)
+
+    def new_upstream_opener(self) -> Any:
+        """Build an opener from the current macOS proxy configuration.
+
+        ``urllib`` snapshots SystemConfiguration proxies when an opener is
+        created. Keeping one opener for the lifetime of this LaunchAgent would
+        therefore retain an unreachable proxy after Wi-Fi/VPN changes.
+        """
+        return build_opener(
+            UpstreamProxyHandler(getproxies()),
+            SameOriginRedirectHandler(),
+        )
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._request_slots.acquire(blocking=False):
@@ -674,7 +688,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             method=self.command,
         )
         try:
-            return None, self.proxy_server.upstream_opener.open(request, timeout=300)
+            opener = self.proxy_server.new_upstream_opener()
+            return None, opener.open(request, timeout=300)
         except HTTPError as error:
             return None, error
 

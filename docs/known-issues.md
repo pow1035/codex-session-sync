@@ -27,9 +27,6 @@
   verified backup, uses compare-and-set plus rollback, and converges again on
   the next run after a process crash. The current audit found zero explicit
   metadata mismatches.
-- HTTPS has no GitHub credential, while the authenticated SSH identity cannot
-  access the configured `pow1035/codex-session-sync` repository. The validated
-  local commit is available; remote publication requires repository access.
 - A `SIGKILL` in the narrow interval after a new snapshot is complete but
   before exit cleanup can temporarily leave two complete snapshot directories.
   The next launch prunes before allocating another snapshot and converges to

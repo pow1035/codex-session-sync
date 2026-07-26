@@ -126,7 +126,8 @@ npm run test:integration
   官方 `additional_tools` 语义，必要时才把已发现工具提升为普通工具。
   安装器会使用独立的命令式认证帮助器读取权限为 `0600` 的 AnyRouter
   凭据，不会把官网登录令牌交给第三方；同时关闭请求压缩，代理还会拒绝
-  JWT 形态身份令牌和未解压请求。
+  JWT 形态身份令牌和未解压请求。每次上游请求都会重新读取当前 macOS
+  系统代理，切换 Wi-Fi、热点或 VPN 后不需要手动重启兼容代理。
 - 同步器默认不会删除 `tool_search_call`/`tool_search_output`。如需对旧的失败
   尾部执行一次性修复，必须显式设置
   `CODEX_SYNC_REPAIR_TOOL_SEARCH_THREAD_IDS=auto` 或指定逗号分隔的线程 ID。

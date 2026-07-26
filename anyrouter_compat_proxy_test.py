@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import anyrouter_compat_proxy as compat_proxy
 from anyrouter_compat_proxy import (
     SameOriginRedirectHandler,
     build_server,
@@ -469,6 +470,20 @@ class ProxyIntegrationTests(unittest.TestCase):
         response.read()
         connection.close()
         self.assertEqual(MockUpstreamHandler.received[-1]["body"]["input"], "chunked")
+
+    def test_system_proxy_configuration_is_refreshed_for_each_request(self):
+        calls = []
+        original_getproxies = compat_proxy.getproxies
+        compat_proxy.getproxies = lambda: calls.append(True) or {}
+        try:
+            plain = {"model": "gpt-5.6-sol", "input": "proxy-refresh"}
+            with self.request(plain) as response:
+                response.read()
+            with self.request(plain) as response:
+                response.read()
+        finally:
+            compat_proxy.getproxies = original_getproxies
+        self.assertEqual(len(calls), 2)
 
     def test_ambiguous_content_length_and_transfer_encoding_is_rejected(self):
         connection = http.client.HTTPConnection(

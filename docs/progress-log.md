@@ -153,3 +153,14 @@
   remained identical. A second live sync created no split or counterpart; it
   synchronized two unrelated active tasks and still converged backup retention
   to one 29 MiB snapshot with zero temporary files.
+- Reproduced a post-install custom failure after a Wi-Fi/VPN change. Python's
+  long-lived opener had cached the previous macOS system proxy endpoint, so the
+  LaunchAgent kept dialing an unreachable address. Upstream openers now refresh
+  SystemConfiguration proxies for every request; the installed build was
+  restarted without creating another backup, and proxy coverage increased to
+  27 tests.
+- A real continuation containing a completed client tool-search pair now
+  reaches the loopback proxy after restart. It no longer returns
+  `invalid_responses_request`; AnyRouter instead returns its current
+  `500 get_channel_failed` high-load response. A separate minimal request with
+  no history reproduced the same upstream capacity error.
