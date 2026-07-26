@@ -469,17 +469,18 @@ function safeHistoryEntry(entry, targetThread = null) {
   const obj = JSON.parse(JSON.stringify(entry.obj));
   if (obj.type === "turn_context") {
     if (!obj.payload || !obj.payload.turn_id) return null;
-    const source = obj.payload;
-    obj.payload = {
-      turn_id: source.turn_id,
-      cwd: source.cwd,
-      workspace_roots: Array.isArray(source.workspace_roots) ? source.workspace_roots : undefined,
-      current_date: source.current_date,
-      timezone: source.timezone,
-      model: targetThread && targetThread.model ? targetThread.model : source.model,
-      effort: targetThread && targetThread.reasoning_effort ? targetThread.reasoning_effort : source.effort,
-    };
-    obj.payload = Object.fromEntries(Object.entries(obj.payload).filter(([, value]) => value !== undefined));
+    // turn_context is part of Codex's persisted resume schema, not merely UI
+    // decoration. Keep its complete schema so Goals and other cold-resume
+    // paths can deserialize synchronized turns. Only provider/model-specific
+    // selection is rewritten for the receiving thread.
+    if (targetThread && targetThread.model) obj.payload.model = targetThread.model;
+    if (targetThread && targetThread.reasoning_effort) {
+      obj.payload.effort = targetThread.reasoning_effort;
+      if (obj.payload.collaboration_mode && obj.payload.collaboration_mode.settings) {
+        obj.payload.collaboration_mode.settings.model = targetThread.model || obj.payload.collaboration_mode.settings.model;
+        obj.payload.collaboration_mode.settings.reasoning_effort = targetThread.reasoning_effort;
+      }
+    }
   } else if (obj.type === "event_msg") {
     if (!obj.payload || !SAFE_HISTORY_EVENT_TYPES.has(obj.payload.type)) return null;
     const source = obj.payload;
@@ -535,6 +536,62 @@ function safeHistoryEntry(entry, targetThread = null) {
     return null;
   }
   return { obj, line: JSON.stringify(obj) };
+}
+
+function completeTurnContext(entry) {
+  return Boolean(
+    entry && entry.obj && entry.obj.type === "turn_context" &&
+    entry.obj.payload && entry.obj.payload.turn_id &&
+    Object.prototype.hasOwnProperty.call(entry.obj.payload, "approval_policy") &&
+    Object.prototype.hasOwnProperty.call(entry.obj.payload, "sandbox_policy")
+  );
+}
+
+function repairSynchronizedTurnContexts(pairs) {
+  let repairedRecords = 0;
+  let repairedThreads = 0;
+  for (const pair of pairs) {
+    if (!pair.old.rollout_path || !pair.child.rollout_path ||
+        !fs.existsSync(pair.old.rollout_path) ||
+        !fs.existsSync(pair.child.rollout_path)) continue;
+
+    const oldEntries = readJsonl(pair.old.rollout_path);
+    const childEntries = readJsonl(pair.child.rollout_path);
+    const sides = [
+      { thread: pair.old, entries: oldEntries, peerEntries: childEntries },
+      { thread: pair.child, entries: childEntries, peerEntries: oldEntries },
+    ];
+
+    for (const side of sides) {
+      const donors = new Map(
+        side.peerEntries
+          .filter(completeTurnContext)
+          .map((entry) => [entry.obj.payload.turn_id, entry])
+      );
+      let changed = 0;
+      const output = side.entries.map((entry) => {
+        if (!entry.obj || entry.obj.type !== "turn_context" ||
+            completeTurnContext(entry) || !entry.obj.payload ||
+            !entry.obj.payload.turn_id) return entry;
+        const donor = donors.get(entry.obj.payload.turn_id);
+        if (!donor) return entry;
+        const repaired = safeHistoryEntry(donor, side.thread);
+        if (!repaired) return entry;
+        repaired.obj.timestamp = entry.obj.timestamp || repaired.obj.timestamp;
+        repaired.line = JSON.stringify(repaired.obj);
+        changed += 1;
+        return repaired;
+      });
+      if (!changed) continue;
+      assertRolloutRewriteSafe(side.thread.rollout_path, "Turn-context schema repair");
+      const before = fs.statSync(side.thread.rollout_path);
+      writeJsonlIfUnchanged(side.thread.rollout_path, before, output);
+      repairedRecords += changed;
+      repairedThreads += 1;
+      log(`Repaired ${changed} synchronized turn-context schema record(s) for "${titleForLog(effectiveTitle(side.thread))}" (${side.thread.id}).`);
+    }
+  }
+  return { records: repairedRecords, threads: repairedThreads };
 }
 
 function closedTurnDigest(entries) {
@@ -4171,8 +4228,9 @@ function main() {
     return;
   }
 
+  const turnContextRepair = repairSynchronizedTurnContexts(syncPairs);
   const historyUpgrade = upgradePortableOnlyPairs(syncPairs, protectedSplitOriginalIds);
-  log(`Found ${syncPairs.length} active mapped pairs. Split conflicts planned: ${conflictSplit.planned}; split conflicts completed: ${conflictSplit.completed}; newly created counterparts: ${createdCounterparts.length}; restored visible-history structure: ${historyUpgrade.upgraded}; skipped unsafe visible-history upgrades: ${historyUpgrade.skippedUnsafe}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; backup files reused: ${backupContext.linked}; backup files copied: ${backupContext.copied}; recovered interrupted archives: ${recoveredInterruptedArchives}; archived linked counterparts: ${archivedCounterparts}; enforced archived tombstones: ${enforcedArchivedTombstones}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; synchronized titles: ${titleSyncResult.displayChangedPairs}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}; repaired catalog rows: ${repairedCatalogRows}. Backup: ${backupDir}`);
+  log(`Found ${syncPairs.length} active mapped pairs. Split conflicts planned: ${conflictSplit.planned}; split conflicts completed: ${conflictSplit.completed}; newly created counterparts: ${createdCounterparts.length}; repaired synchronized turn contexts: ${turnContextRepair.records}; restored visible-history structure: ${historyUpgrade.upgraded}; skipped unsafe visible-history upgrades: ${historyUpgrade.skippedUnsafe}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; backup files reused: ${backupContext.linked}; backup files copied: ${backupContext.copied}; recovered interrupted archives: ${recoveredInterruptedArchives}; archived linked counterparts: ${archivedCounterparts}; enforced archived tombstones: ${enforcedArchivedTombstones}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; synchronized titles: ${titleSyncResult.displayChangedPairs}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}; repaired catalog rows: ${repairedCatalogRows}. Backup: ${backupDir}`);
   const results = syncPairs.map((pair) => syncPair(pair, state));
   applyDbTimes(
     results.filter((result) =>
@@ -4232,6 +4290,7 @@ function main() {
     repairedCatalogRows,
     activeTitleSync.stateRows,
     activeTitleSync.catalogRows,
+    turnContextRepair.records,
     historyUpgrade.upgraded,
     results.filter((result) => result.didWrite).length,
     finalRepairedArchivedPaths,
@@ -4241,7 +4300,7 @@ function main() {
   ].reduce((sum, value) => sum + Number(value || 0), 0);
   discardRedundantBackup(backupContext, materialMutationCount);
 
-  log(`Sync complete. Split conflicts planned: ${conflictSplit.planned}; split conflicts completed: ${conflictSplit.completed}; newly created counterparts: ${createdCounterparts.length}; restored visible-history structure: ${historyUpgrade.upgraded}; skipped unsafe visible-history upgrades: ${historyUpgrade.skippedUnsafe}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; deferred incomplete turns: ${deferredIncomplete.length}; recovered interrupted archives: ${recoveredInterruptedArchives}; archived linked counterparts: ${archivedCounterparts}; enforced archived tombstones: ${enforcedArchivedTombstones}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; synchronized titles: ${titleSyncResult.displayChangedPairs}; title storage rows repaired: ${titleSyncResult.stateRows + titleSyncResult.catalogRows}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}; skipped conflicting pairs: ${skippedConflicts.length}; repaired catalog rows: ${repairedCatalogRows}; initialized pairs: ${initialized.length}; changed pairs: ${changed.length}; added to API/custom: ${oldAdded}; added to OpenAI: ${childAdded}; rollout backups copied: ${backupContext.copied}; rollout backups reused: ${backupContext.linked}.`);
+  log(`Sync complete. Split conflicts planned: ${conflictSplit.planned}; split conflicts completed: ${conflictSplit.completed}; newly created counterparts: ${createdCounterparts.length}; repaired synchronized turn contexts: ${turnContextRepair.records}; restored visible-history structure: ${historyUpgrade.upgraded}; skipped unsafe visible-history upgrades: ${historyUpgrade.skippedUnsafe}; repaired invisible active threads: ${repairedInvisibleThreads}; repaired premature pair baselines: ${repairedPrematureBaselines}; deferred incomplete turns: ${deferredIncomplete.length}; recovered interrupted archives: ${recoveredInterruptedArchives}; archived linked counterparts: ${archivedCounterparts}; enforced archived tombstones: ${enforcedArchivedTombstones}; migrated retired active models: ${modelMigration.migrated}; repaired model metadata: ${modelMigration.metadataOverrides}; deferred active model migrations: ${modelMigration.deferredOpen}; skipped empty model shells: ${modelMigration.skippedEmptyShells}; synchronized titles: ${titleSyncResult.displayChangedPairs}; title storage rows repaired: ${titleSyncResult.stateRows + titleSyncResult.catalogRows}; skipped historical missing counterparts: ${ensureResult.skippedHistorical}; skipped pre-baseline threads: ${ensureResult.skippedOld}; skipped conflicting pairs: ${skippedConflicts.length}; repaired catalog rows: ${repairedCatalogRows}; initialized pairs: ${initialized.length}; changed pairs: ${changed.length}; added to API/custom: ${oldAdded}; added to OpenAI: ${childAdded}; rollout backups copied: ${backupContext.copied}; rollout backups reused: ${backupContext.linked}.`);
   for (const result of skippedConflicts.slice(0, 20)) {
     log(`WARNING: Skipped conflicting pair "${titleForLog(result.title)}" (${result.oldId} <-> ${result.childId}); pending API/custom -> OpenAI: ${result.apiCustomPending}, pending OpenAI -> API/custom: ${result.openaiPending}.`);
   }
@@ -4284,6 +4343,7 @@ module.exports = {
   markPairActiveInState,
   metadataPairLinked,
   parseClosedTurns,
+  repairSynchronizedTurnContexts,
   rejectedToolSearchRepair,
   resolvePairTitle,
   rotateLogIfNeeded,

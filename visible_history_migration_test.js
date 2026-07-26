@@ -119,6 +119,10 @@ const env = {
   CODEX_SYNC_SESSIONS_ROOT: path.join(tmp, "sessions"),
   CODEX_SYNC_WORK_DIR: path.join(tmp, "sync-work"),
   CODEX_SYNC_ALLOW_BOOTSTRAP: "1",
+  // Every rollout in this fixture lives under the isolated temporary root;
+  // the live app-server cannot have any of them open.
+  CODEX_SYNC_ALLOW_APP_RUNNING_REWRITE: "1",
+  CODEX_SYNC_ALLOW_UNCHECKED_REWRITE: "1",
 };
 const first = run(process.execPath, [path.join(ROOT, "sync_codex_sessions.js")], { env });
 assert.match(first, /restored visible-history structure: 1/);
@@ -132,7 +136,11 @@ assert.equal(meta.payload.model_provider, target.model_provider);
 assert.equal(meta.payload.model, target.model);
 assert.equal(after.filter((entry) => entry.type === "event_msg" && entry.payload?.type === "task_started").length, expectedClosedTurns);
 assert.equal(closedTurnCount(after), expectedClosedTurns);
-for (const entry of after.filter((entry) => entry.type === "turn_context")) assert.equal(entry.payload.model, target.model);
+for (const entry of after.filter((entry) => entry.type === "turn_context")) {
+  assert.equal(entry.payload.model, target.model);
+  assert.ok(Object.hasOwn(entry.payload, "approval_policy"));
+  assert.ok(Object.hasOwn(entry.payload, "sandbox_policy"));
+}
 for (const entry of after) {
   assert.notEqual(entry.type, "compacted");
   assert.notEqual(entry.type, "reasoning");
@@ -142,9 +150,25 @@ for (const entry of after) {
   }
 }
 
+const malformed = readEntries(targetCopy);
+const malformedContext = malformed.find((entry) => entry.type === "turn_context");
+assert.ok(malformedContext, "fixture needs a synchronized turn context");
+delete malformedContext.payload.approval_policy;
+delete malformedContext.payload.sandbox_policy;
+fs.writeFileSync(targetCopy, malformed.map(JSON.stringify).join("\n") + "\n");
+const repaired = run(process.execPath, [path.join(ROOT, "sync_codex_sessions.js")], { env });
+assert.match(repaired, /repaired synchronized turn contexts: 1/);
+const repairedContext = readEntries(targetCopy).find(
+  (entry) => entry.type === "turn_context" &&
+    entry.payload.turn_id === malformedContext.payload.turn_id
+);
+assert.ok(Object.hasOwn(repairedContext.payload, "approval_policy"));
+assert.ok(Object.hasOwn(repairedContext.payload, "sandbox_policy"));
+
 const beforeIdempotent = hash(targetCopy);
-const second = run(process.execPath, [path.join(ROOT, "sync_codex_sessions.js")], { env });
-assert.match(second, /changed pairs: 0/);
+const third = run(process.execPath, [path.join(ROOT, "sync_codex_sessions.js")], { env });
+assert.match(third, /repaired synchronized turn contexts: 0/);
+assert.match(third, /changed pairs: 0/);
 assert.equal(hash(targetCopy), beforeIdempotent);
 assert.equal(run("sqlite3", [stateDb, "PRAGMA integrity_check;"]).trim(), "ok");
 

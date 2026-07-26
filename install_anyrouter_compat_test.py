@@ -3,6 +3,7 @@
 import unittest
 import subprocess
 import tempfile
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -53,6 +54,34 @@ tool_suggest = false
         payload = plist_payload()
         self.assertEqual(payload["ProgramArguments"][1], str(RUNTIME_PROXY_SCRIPT))
         self.assertEqual(payload["WorkingDirectory"], str(RUNTIME_PROXY_SCRIPT.parent))
+
+    def test_ensure_ready_does_not_restart_current_healthy_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.toml"
+            source = root / "source.py"
+            runtime = root / "runtime.py"
+            source.write_bytes(b"same-build")
+            runtime.write_bytes(b"same-build")
+            config.write_text(
+                desired_config('model_provider = "openai"\n'),
+                encoding="utf-8",
+            )
+            expected = installer.hashlib.sha256(source.read_bytes()).hexdigest()
+            response = mock.MagicMock()
+            response.status = 200
+            response.read.return_value = json.dumps(
+                {"build_sha256": expected}
+            ).encode()
+            response.__enter__.return_value = response
+            response.__exit__.return_value = False
+            with mock.patch.object(installer, "CONFIG_PATH", config), \
+                    mock.patch.object(installer, "PROXY_SCRIPT", source), \
+                    mock.patch.object(installer, "RUNTIME_PROXY_SCRIPT", runtime), \
+                    mock.patch.object(installer.urllib.request, "urlopen", return_value=response), \
+                    mock.patch.object(installer, "install") as install:
+                self.assertFalse(installer.ensure_ready())
+                install.assert_not_called()
 
     def test_failed_bootstrap_restores_config_plist_and_runtime(self):
         with tempfile.TemporaryDirectory() as directory:

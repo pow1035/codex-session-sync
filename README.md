@@ -21,7 +21,7 @@
 
 同步器以“完整回合”为最小单位，只复制用户可见且可跨 provider 使用的内容：
 
-- 允许：用户消息、最终助手消息、`task_started`、`turn_context`、健康的
+- 允许：用户消息、最终助手消息、`task_started`、完整可冷恢复的 `turn_context`、健康的
   `task_complete`，以及带用户起点的明确 `turn_aborted`；
 - 排除：reasoning、工具调用、工具输出、压缩上下文、加密状态和 provider
   专属字段；
@@ -124,6 +124,8 @@ npm run test:integration
   `python3 install_anyrouter_compat.py install` 可安装仅监听回环地址的常驻兼容
   代理，并将 custom provider 指向 `http://127.0.0.1:17831/v1`。代理优先保留
   官方 `additional_tools` 语义，必要时才把已发现工具提升为普通工具。
+  `codex_same.py` 每次同步前都会幂等检查该配置与运行版本；健康且版本一致时不会
+  重启代理，也不会新增配置备份。
   安装器会使用独立的命令式认证帮助器读取权限为 `0600` 的 AnyRouter
   凭据，不会把官网登录令牌交给第三方；同时关闭请求压缩，代理还会拒绝
   JWT 形态身份令牌和未解压请求。每次上游请求都会重新读取当前 macOS
@@ -131,6 +133,10 @@ npm run test:integration
 - 同步器默认不会删除 `tool_search_call`/`tool_search_output`。如需对旧的失败
   尾部执行一次性修复，必须显式设置
   `CODEX_SYNC_REPAIR_TOOL_SEARCH_THREAD_IDS=auto` 或指定逗号分隔的线程 ID。
+- 旧版同步器曾生成缺少 `approval_policy`/`sandbox_policy` 的精简
+  `turn_context`，导致 Goal 冷恢复出现解析警告或绕开当前会话配置。同步器现在
+  仅在配对侧存在同一 `turn_id` 的完整记录时自动恢复完整 schema，无法证明来源
+  的孤立记录保持不动。
 - 意外的单侧归档可在确认两个配对 ID 后执行一次
   `CODEX_SYNC_RESTORE_ACTIVE_PAIR_IDS=custom-id,openai-id python3 codex_same.py`。
   同步器会在同一轮备份中保存数据库和待移动 rollout；目标位置存在不同内容时

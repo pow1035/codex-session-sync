@@ -292,11 +292,35 @@ def status() -> int:
         return 1
 
 
+def ensure_ready() -> bool:
+    """Converge config and runtime without restarting a healthy current build."""
+    config_changed = ensure_config()
+    expected_build = hashlib.sha256(PROXY_SCRIPT.read_bytes()).hexdigest()
+    try:
+        with urllib.request.urlopen(HEALTH_URL, timeout=2) as response:
+            health = json.loads(response.read())
+        runtime_current = (
+            RUNTIME_PROXY_SCRIPT.exists()
+            and hashlib.sha256(RUNTIME_PROXY_SCRIPT.read_bytes()).hexdigest()
+            == expected_build
+        )
+        if (
+            response.status == 200
+            and health.get("build_sha256") == expected_build
+            and runtime_current
+        ):
+            return config_changed
+    except Exception:
+        pass
+    install()
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("install", "uninstall", "ensure-config", "status"),
+        choices=("install", "uninstall", "ensure", "ensure-config", "status"),
         default="install",
         nargs="?",
     )
@@ -315,6 +339,9 @@ def main() -> int:
         return 0
     if command == "ensure-config":
         print("updated" if ensure_config() else "unchanged")
+        return 0
+    if command == "ensure":
+        print("updated" if ensure_ready() else "unchanged")
         return 0
     return status()
 

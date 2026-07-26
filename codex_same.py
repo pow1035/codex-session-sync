@@ -9,6 +9,7 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent
 SYNC_SCRIPT = ROOT / "sync_codex_sessions.js"
+ANYROUTER_INSTALLER = ROOT / "install_anyrouter_compat.py"
 DEFAULT_WORK_DIR = Path.home() / "Library/Application Support/codex-session-sync"
 WORK_DIR = Path(os.environ.get("CODEX_SYNC_WORK_DIR", DEFAULT_WORK_DIR))
 STATE_DB = Path(os.environ.get("CODEX_SYNC_STATE_DB", Path.home() / ".codex/state_5.sqlite"))
@@ -79,6 +80,17 @@ def main() -> int:
     print("同步前会备份数据库、会话文件和同步状态。", flush=True)
     print(f"运行状态目录: {WORK_DIR}", flush=True)
     print(flush=True)
+
+    if ANYROUTER_INSTALLER.exists():
+        print("检查 AnyRouter 本地兼容代理与 custom 配置……", flush=True)
+        proxy_code = run_stream(
+            [sys.executable, str(ANYROUTER_INSTALLER), "ensure"],
+            cwd=Path.cwd(),
+        )
+        if proxy_code != 0:
+            print("AnyRouter 兼容代理安装或配置失败，已停止同步。", file=sys.stderr)
+            return proxy_code
+        print(flush=True)
 
     node = find_node()
     code = run_stream([node, str(SYNC_SCRIPT)], cwd=Path.cwd())
