@@ -20,13 +20,19 @@ from typing import Dict, Iterable
 
 
 LABEL = "com.codex.anyrouter-compat"
+CONFIG_GUARD_LABEL = f"{LABEL}-config"
 ROOT = Path(__file__).resolve().parent
 PROXY_SCRIPT = ROOT / "anyrouter_compat_proxy.py"
 AUTH_HELPER_SCRIPT = ROOT / "anyrouter_auth_helper.py"
+INSTALLER_SCRIPT = Path(__file__).resolve()
 RUNTIME_DIR = Path.home() / "Library/Application Support/codex-anyrouter-compat"
 RUNTIME_PROXY_SCRIPT = RUNTIME_DIR / "anyrouter_compat_proxy.py"
 RUNTIME_AUTH_HELPER_SCRIPT = RUNTIME_DIR / "anyrouter_auth_helper.py"
+RUNTIME_INSTALLER_SCRIPT = RUNTIME_DIR / "install_anyrouter_compat.py"
 PLIST_PATH = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+CONFIG_GUARD_PLIST_PATH = (
+    Path.home() / "Library/LaunchAgents" / f"{CONFIG_GUARD_LABEL}.plist"
+)
 CONFIG_PATH = Path.home() / ".codex/config.toml"
 LOCAL_BASE_URL = "http://127.0.0.1:17831/v1"
 UPSTREAM_URL = "https://anyrouter.top"
@@ -184,6 +190,25 @@ def plist_payload() -> Dict[str, object]:
     }
 
 
+def config_guard_plist_payload() -> Dict[str, object]:
+    """Repair provider drift at login and whenever Codex rewrites config.toml."""
+    return {
+        "Label": CONFIG_GUARD_LABEL,
+        "ProgramArguments": [
+            "/usr/bin/python3",
+            str(RUNTIME_INSTALLER_SCRIPT),
+            "ensure-config",
+        ],
+        "WorkingDirectory": str(RUNTIME_DIR),
+        "RunAtLoad": True,
+        "WatchPaths": [str(CONFIG_PATH)],
+        "ProcessType": "Background",
+        "ThrottleInterval": 2,
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": "/dev/null",
+    }
+
+
 def run_launchctl(args: Iterable[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["launchctl", *args],
@@ -194,14 +219,21 @@ def run_launchctl(args: Iterable[str], check: bool = True) -> subprocess.Complet
     )
 
 
+def launch_agent_loaded(label: str) -> bool:
+    domain = f"gui/{os.getuid()}"
+    return run_launchctl(["print", f"{domain}/{label}"], check=False).returncode == 0
+
+
 def install() -> None:
     domain = f"gui/{os.getuid()}"
     originals = {}
     for name, path in (
         ("config", CONFIG_PATH),
         ("plist", PLIST_PATH),
+        ("config_guard_plist", CONFIG_GUARD_PLIST_PATH),
         ("runtime", RUNTIME_PROXY_SCRIPT),
         ("auth_helper", RUNTIME_AUTH_HELPER_SCRIPT),
+        ("runtime_installer", RUNTIME_INSTALLER_SCRIPT),
     ):
         originals[name] = (
             path.read_bytes() if path.exists() else None,
@@ -213,12 +245,26 @@ def install() -> None:
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         shutil.copy2(PROXY_SCRIPT, RUNTIME_PROXY_SCRIPT)
         shutil.copy2(AUTH_HELPER_SCRIPT, RUNTIME_AUTH_HELPER_SCRIPT)
+        shutil.copy2(INSTALLER_SCRIPT, RUNTIME_INSTALLER_SCRIPT)
         payload = plistlib.dumps(plist_payload(), sort_keys=False)
         _atomic_write(PLIST_PATH, payload, originals["plist"][1] or 0o644)
+        guard_payload = plistlib.dumps(
+            config_guard_plist_payload(), sort_keys=False
+        )
+        _atomic_write(
+            CONFIG_GUARD_PLIST_PATH,
+            guard_payload,
+            originals["config_guard_plist"][1] or 0o644,
+        )
 
+        run_launchctl(
+            ["bootout", domain, str(CONFIG_GUARD_PLIST_PATH)], check=False
+        )
         run_launchctl(["bootout", domain, str(PLIST_PATH)], check=False)
         run_launchctl(["bootstrap", domain, str(PLIST_PATH)])
+        run_launchctl(["bootstrap", domain, str(CONFIG_GUARD_PLIST_PATH)])
         run_launchctl(["kickstart", "-k", f"{domain}/{LABEL}"])
+        run_launchctl(["kickstart", "-k", f"{domain}/{CONFIG_GUARD_LABEL}"])
 
         last_error = None
         expected_build = hashlib.sha256(PROXY_SCRIPT.read_bytes()).hexdigest()
@@ -242,6 +288,9 @@ def install() -> None:
     except Exception as install_error:
         rollback_errors = []
         try:
+            run_launchctl(
+                ["bootout", domain, str(CONFIG_GUARD_PLIST_PATH)], check=False
+            )
             run_launchctl(["bootout", domain, str(PLIST_PATH)], check=False)
         except Exception as error:  # pragma: no cover - launchctl defensive path
             rollback_errors.append(f"bootout: {error}")
@@ -249,8 +298,10 @@ def install() -> None:
         for name, path in (
             ("config", CONFIG_PATH),
             ("plist", PLIST_PATH),
+            ("config_guard_plist", CONFIG_GUARD_PLIST_PATH),
             ("runtime", RUNTIME_PROXY_SCRIPT),
             ("auth_helper", RUNTIME_AUTH_HELPER_SCRIPT),
+            ("runtime_installer", RUNTIME_INSTALLER_SCRIPT),
         ):
             data, mode = originals[name]
             try:
@@ -268,6 +319,16 @@ def install() -> None:
                 run_launchctl(["kickstart", "-k", f"{domain}/{LABEL}"])
             except Exception as error:  # pragma: no cover - launchctl defensive path
                 rollback_errors.append(f"restart previous agent: {error}")
+        if originals["config_guard_plist"][0] is not None:
+            try:
+                run_launchctl(
+                    ["bootstrap", domain, str(CONFIG_GUARD_PLIST_PATH)]
+                )
+                run_launchctl(
+                    ["kickstart", "-k", f"{domain}/{CONFIG_GUARD_LABEL}"]
+                )
+            except Exception as error:  # pragma: no cover - defensive path
+                rollback_errors.append(f"restart previous config guard: {error}")
         if rollback_errors:
             raise RuntimeError(
                 f"Install failed: {install_error}; rollback errors: {'; '.join(rollback_errors)}"
@@ -277,7 +338,12 @@ def install() -> None:
 
 def uninstall() -> None:
     domain = f"gui/{os.getuid()}"
+    run_launchctl(
+        ["bootout", domain, str(CONFIG_GUARD_PLIST_PATH)], check=False
+    )
     run_launchctl(["bootout", domain, str(PLIST_PATH)], check=False)
+    if CONFIG_GUARD_PLIST_PATH.exists():
+        CONFIG_GUARD_PLIST_PATH.unlink()
     if PLIST_PATH.exists():
         PLIST_PATH.unlink()
 
@@ -304,10 +370,23 @@ def ensure_ready() -> bool:
             and hashlib.sha256(RUNTIME_PROXY_SCRIPT.read_bytes()).hexdigest()
             == expected_build
         )
+        support_files_current = (
+            RUNTIME_AUTH_HELPER_SCRIPT.exists()
+            and RUNTIME_INSTALLER_SCRIPT.exists()
+            and hashlib.sha256(RUNTIME_INSTALLER_SCRIPT.read_bytes()).hexdigest()
+            == hashlib.sha256(INSTALLER_SCRIPT.read_bytes()).hexdigest()
+            and PLIST_PATH.exists()
+            and CONFIG_GUARD_PLIST_PATH.exists()
+            and plistlib.loads(CONFIG_GUARD_PLIST_PATH.read_bytes())
+            == config_guard_plist_payload()
+            and launch_agent_loaded(LABEL)
+            and launch_agent_loaded(CONFIG_GUARD_LABEL)
+        )
         if (
             response.status == 200
             and health.get("build_sha256") == expected_build
             and runtime_current
+            and support_files_current
         ):
             return config_changed
     except Exception:
